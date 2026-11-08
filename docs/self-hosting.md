@@ -84,12 +84,12 @@ sudo mkdir -p /opt/silique/releases
 sudo chown -R root:root /opt/silique/releases
 # as root (the build writes into the checkout):
 cd /opt/silique/releases
-git clone https://github.com/<your-fork>/silique-server-public silique-0.2.3
-cd silique-0.2.3
+git clone https://github.com/Haniewicz/silique-self-hosted silique-0.2.45
+cd silique-0.2.45
 npm ci
 npm run build
 cd /opt/silique
-sudo ln -sfn /opt/silique/releases/silique-0.2.3 current
+sudo ln -sfn /opt/silique/releases/silique-0.2.45 current
 sudo chown -R silique:silique /opt/silique/current
 ```
 
@@ -303,7 +303,7 @@ instantly:
 
 ```sh
 cd /opt/silique/releases
-git clone https://github.com/<your-fork>/silique-server-public silique-<new-version>
+git clone https://github.com/Haniewicz/silique-self-hosted silique-<new-version>
 cd silique-<new-version>
 npm ci
 npm run build
