@@ -1,0 +1,38 @@
+{
+  "name": "silique-server",
+  "version": "0.2.3",
+  "description": "Self-hosted single-user sync server for end-to-end encrypted notes (Node.js, Fastify, SQLite).",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "admin": "tsx src/admin.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@fastify/cors": "^11.3.1",
+    "@fastify/helmet": "^13.2.0",
+    "@fastify/rate-limit": "^11.2.1",
+    "fastify": "^5.12.7",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "private": false,
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

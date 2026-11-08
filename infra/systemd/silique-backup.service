@@ -1,0 +1,14 @@
+[Unit]
+Description=Consistent online backup of Silique
+After=silique.service
+[Service]
+Type=oneshot
+User=silique
+Group=silique
+UMask=0077
+EnvironmentFile=/etc/silique/server.env
+ExecStart=/opt/silique-node/bin/node /opt/silique/current/infra/backup/backup.mjs /var/backups/silique
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/silique /var/backups/silique

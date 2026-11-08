@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily Silique backup
+[Timer]
+OnCalendar=*-*-* 03:20:00 Europe/Warsaw
+RandomizedDelaySec=10m
+Persistent=true
+[Install]
+WantedBy=timers.target

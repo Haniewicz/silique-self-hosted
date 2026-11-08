@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+*.sqlite*
+coverage/
+.DS_Store
+.tmp-e2e/

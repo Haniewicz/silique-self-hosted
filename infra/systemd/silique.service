@@ -1,0 +1,28 @@
+[Unit]
+Description=Silique encrypted synchronization API
+After=network.target
+
+[Service]
+Type=simple
+User=silique
+Group=silique
+WorkingDirectory=/opt/silique/current
+EnvironmentFile=/etc/silique/server.env
+ExecStart=/opt/silique-node/bin/node /opt/silique/current/dist/src/index.js
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=silique
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/silique
+
+[Install]
+WantedBy=multi-user.target
