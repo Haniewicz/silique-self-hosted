@@ -335,6 +335,102 @@ class InstallerTests(unittest.TestCase):
                     "a copyable unit block contains a placeholder:\n" + block
                 )
 
+    def test_14_tls_nginx_install_planned(self):
+        """--dry-run --tls nginx plans the nginx package BEFORE the proxy config."""
+        _, out, err = run_installer(
+            *self.base, "--dry-run", "--tls", "nginx",
+            "--self-signed", "--domain", "x"
+        )
+        combined = out + err
+        self.assertIn("install -y", combined,
+                      "plan must contain an apt-get install step")
+        self.assertIn("nginx", combined,
+                      "plan must mention the nginx package")
+        self.assertIn("write nginx config", combined,
+                      "plan must contain the proxy-config step")
+        # The package install must come before the proxy config step.
+        self.assertLess(
+            combined.index("install -y nginx"),
+            combined.index("write nginx config"),
+            "nginx package install must be planned before writing proxy config",
+        )
+
+    def test_15_tls_missing_proxy_fails_early(self):
+        """--root --tls nginx without nginx on PATH fails with a clear message."""
+        # Ensure nginx is absent from PATH regardless of the test host.
+        stripped = _make_no_node_path(self.tmp)
+        # _make_no_node_path leaves symlinks for standard tools; drop nginx/caddy
+        # symlinks if they somehow exist there, and run with a PATH that has the
+        # real node via --node-bin but no nginx.
+        nginx_link = os.path.join(stripped, "nginx")
+        if os.path.islink(nginx_link) or os.path.exists(nginx_link):
+            os.remove(nginx_link)
+        env = {"PATH": stripped}
+        rc, out, err = run_installer(
+            *self.base, "--tls", "nginx", "--self-signed", "--domain", "x",
+            env=env, expect=None,
+        )
+        self.assertNotEqual(rc, 0, "install must fail when nginx is missing")
+        combined = out + err
+        self.assertIn("nginx", combined,
+                      "error must name nginx")
+        self.assertNotIn("ln: failed to create symbolic link", combined,
+                         "must fail early with a clear message, not a late ln error")
+
+    def test_16_install_resumes_incomplete(self):
+        """Partial install (server.env, no marker) resumes; complete marker -> upgrade."""
+        state = os.path.join(self.root, "etc", "silique", "install-state")
+        env = os.path.join(self.root, "etc", "silique", "server.env")
+
+        # Simulate a partial install: server.env exists but no complete marker.
+        os.makedirs(os.path.dirname(env), exist_ok=True)
+        with open(env, "w") as f:
+            f.write("HOST=127.0.0.1\n")
+
+        # 'install' must resume (rc=0) and finish by writing the marker.
+        run_installer(*self.base)
+        self.assertTrue(os.path.isfile(state), "install-state marker not written")
+        with open(state) as f:
+            self.assertTrue("complete" in f.read(),
+                            "install-state marker must record 'complete'")
+
+        # Now a fresh install with the marker present must demand 'upgrade' (rc=2).
+        rc, _, err = run_installer(*self.base, expect=2)
+        self.assertIn("upgrade", err.lower(),
+                      "a completed install must point at 'upgrade'")
+
+    def test_17_verify_before_tls(self):
+        """The dry-run plan verifies the data plane BEFORE the TLS step."""
+        _, out, err = run_installer(
+            *self.base, "--dry-run", "--tls", "nginx",
+            "--self-signed", "--domain", "x"
+        )
+        combined = out + err
+        self.assertIn("backup", combined,
+                      "plan must include the backup/data-plane verification")
+        self.assertIn("write nginx config", combined,
+                      "plan must include the TLS step")
+        # Data-plane verification (health/backup) must be planned before TLS.
+        verify_idx = combined.index("verify data plane")
+        tls_idx = combined.index("write nginx config")
+        self.assertLess(verify_idx, tls_idx,
+                        "data-plane verification must be planned before TLS")
+
+    def test_18_guide_installs_proxy(self):
+        """The manual guide installs nginx (and Caddy) in the proxy sections."""
+        with open(DOCS) as f:
+            text = f.read()
+        # nginx package install present in the proxy/TLS section.
+        self.assertIn("apt-get install -y nginx", text,
+                      "guide must install nginx in the proxy section")
+        # Caddy equivalent: either an explicit install command or a clear
+        # reference to Caddy's own installation documentation.
+        self.assertTrue(
+            ("apt-get install -y caddy" in text)
+            or re.search(r"caddyserver\.com/docs/install", text),
+            "guide must install Caddy or point to the Caddy install docs",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

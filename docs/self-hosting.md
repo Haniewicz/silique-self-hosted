@@ -112,7 +112,9 @@ sudo apt-get install -y curl ca-certificates git gnupg
 ```
 
 (The installer `infra/install.sh` installs these automatically via
-`apt-get install -y` when it detects they are missing.)
+`apt-get install -y` when it detects they are missing. When you pass
+`--tls nginx` or `--tls caddy` it also installs the matching proxy package,
+`nginx` or `caddy`, before writing any proxy configuration.)
 
 ### Node.js 24
 
@@ -383,7 +385,10 @@ TLS-terminating reverse proxy exposes it to the network.
 
 ### Option A — Caddy
 
-Caddy manages certificates automatically. Three lines:
+Caddy manages certificates automatically. Install it first
+([Caddy install docs](https://caddyserver.com/docs/install), or from your
+distribution's packages with `sudo apt-get install -y caddy`), then write three
+lines:
 
 ```
 notes.example.com {
@@ -399,6 +404,15 @@ sudo systemctl reload caddy
 ```
 
 ### Option B — nginx
+
+Install nginx first:
+
+```sh
+sudo apt-get install -y nginx
+```
+
+Then write your site configuration (substituting your own domain and
+certificate paths):
 
 ```nginx
 server {
@@ -424,6 +438,13 @@ server {
     server_name notes.example.com;
     return 301 https://$host$request_uri;
 }
+```
+
+Enable the site and reload nginx:
+
+```sh
+sudo ln -s /etc/nginx/sites-available/silique /etc/nginx/sites-enabled/silique
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
 > The server sets `trustProxy:false`, so it ignores `X-Forwarded-*`; the

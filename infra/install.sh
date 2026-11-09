@@ -40,6 +40,7 @@ NODE_DIR="/opt/silique-node"
 DATA_DIR="/var/lib/silique"
 BACKUPS_DIR="/var/backups/silique"
 CONFIG_FILE="/etc/silique/server.env"
+STATE_FILE="/etc/silique/install-state"
 UNIT_DIR="/etc/systemd/system"
 
 HOST="127.0.0.1"
@@ -59,6 +60,20 @@ info() { printf '==> %s\n' "$*" >&2; }
 warn() { printf '!! %s\n' "$*" >&2; }
 plan() { printf '    [plan] %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+# --- install-state marker ----------------------------------------------------
+# A completed install writes 'complete' to STATE_FILE. Until that marker exists
+# an install is treated as incomplete and `install` resumes idempotently from
+# where it left off instead of refusing with "use upgrade".
+install_complete() { [ -f "$STATE_FILE" ] && grep -qx 'complete' "$STATE_FILE"; }
+mark_complete() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  printf 'complete\n' > "$STATE_FILE"
+  if [ -z "$ROOT_PREFIX" ]; then
+    chmod 0644 "$STATE_FILE"
+    chown root:root "$STATE_FILE" 2>/dev/null || true
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -221,13 +236,27 @@ preflight() {
   command -v git  >/dev/null 2>&1 || missing="$missing git"
   command -v gnupg >/dev/null 2>&1 || missing="$missing gnupg"
   dpkg -s ca-certificates >/dev/null 2>&1 || missing="$missing ca-certificates"
+  # Select the reverse-proxy package for the requested TLS mode so it is
+  # installed BEFORE any config is written (a missing binary previously only
+  # surfaced as a late, unreadable `ln` failure).
+  case "$TLS_MODE" in
+    nginx) command -v nginx >/dev/null 2>&1 || missing="$missing nginx" ;;
+    caddy) command -v caddy >/dev/null 2>&1 || missing="$missing caddy" ;;
+  esac
   NEED_PKGS="${missing# }"
 }
 
 install_packages() {
   if [ "$DRY_RUN" -eq 1 ]; then
-    if [ -n "${NEED_PKGS:-}" ]; then
-      plan "apt-get install -y $NEED_PKGS"
+    # A dry-run's job is to show the full plan, so for --tls nginx|caddy always
+    # plan the proxy package even if it happens to already be present.
+    local pkgs="${NEED_PKGS:-}"
+    case "$TLS_MODE" in
+      nginx) [[ " $pkgs " == *" nginx "* ]] || pkgs="${pkgs:+$pkgs }nginx" ;;
+      caddy) [[ " $pkgs " == *" caddy "* ]] || pkgs="${pkgs:+$pkgs }caddy" ;;
+    esac
+    if [ -n "$pkgs" ]; then
+      plan "apt-get install -y $pkgs"
     else
       plan "install packages: none missing"
     fi
@@ -406,6 +435,31 @@ verify_health() {
   info "Service verified: /health ok, discovery ok"
 }
 
+# Verify the data plane -- service liveness, /health, discovery and a first
+# backup passing quick_check -- independently of any proxy/TLS step so a proxy
+# failure can never hide a missing or broken backup. Returns nonzero on failure.
+verify_data_plane() {
+  sleep 2
+  if ! systemctl is-active --quiet silique.service; then
+    die "silique.service did not reach 'active' state" 1
+  fi
+  verify_health
+  if [ "$NO_BACKUP_TIMER" -eq 0 ]; then
+    # Run one backup now and check it passes quick_check.
+    systemctl start silique-backup.service || die "backup service failed" 1
+    local newest; newest="$(ls -1t "$BACKUPS_DIR"/silique-*.sqlite 2>/dev/null | head -1)"
+    [ -n "$newest" ] || die "no backup file produced" 1
+    local qc
+    if command -v sqlite3 >/dev/null 2>&1; then
+      qc="$(sqlite3 "$newest" 'PRAGMA quick_check;' 2>/dev/null)"
+    else
+      qc="$("$NODE" --input-type=module -e "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[1]);console.log(d.prepare('PRAGMA quick_check').get().quick_check);d.close();" "$newest")"
+    fi
+    [ "$qc" = "ok" ] || die "backup quick_check != ok (got: $qc)" 1
+    info "Backup verified: quick_check=ok"
+  fi
+}
+
 # --- Do a single backup ------------------------------------------------------
 do_backup() {
   local db="$DATA_DIR/silique.sqlite"
@@ -425,6 +479,16 @@ do_backup() {
 }
 
 # --- TLS setup ---------------------------------------------------------------
+require_proxy() {
+  # Fail before anything is written/enabled when the reverse proxy program the
+  # requested TLS mode needs is missing. This is also the message users get on a
+  # resumed incomplete install where the package step never ran. In --dry-run we
+  # only plan (install_packages already printed the package step), so do not die.
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  command -v "$1" >/dev/null 2>&1 || \
+    die "reverse proxy program '$1' not found; install it first (e.g. 'apt-get install -y $1') and re-run this command to resume" 1
+}
+
 setup_tls() {
   case "$TLS_MODE" in
     none)
@@ -433,6 +497,7 @@ setup_tls() {
       ;;
     caddy)
       [ -n "$DOMAIN" ] || die "--tls caddy requires --domain" 2
+      require_proxy caddy
       if [ "$DRY_RUN" -eq 1 ]; then
         plan "write Caddyfile for $DOMAIN"
         return 0
@@ -444,6 +509,7 @@ setup_tls() {
       ;;
     nginx)
       [ -n "$DOMAIN" ] || die "--tls nginx requires --domain" 2
+      require_proxy nginx
       if [ "$DRY_RUN" -eq 1 ]; then
         plan "write nginx config for $DOMAIN (cert: $([ $SELF_SIGNED -eq 1 ] && echo self-signed || echo existing))"
         return 0
@@ -500,7 +566,16 @@ server {
 }
 EOF
       if [ -z "$ROOT_PREFIX" ]; then
+        # Enable the site, then validate the finished config with `nginx -t`;
+        # on failure remove the link again so nginx is never left broken.
         ln -sf "$conf" "$nginx_root/sites-enabled/silique"
+        if ! nginx -t >/dev/null 2>&1; then
+          rm -f "$nginx_root/sites-enabled/silique"
+          die "nginx config failed validation ('nginx -t'); disabled and removed" 1
+        fi
+        systemctl reload nginx 2>/dev/null \
+          || systemctl start nginx 2>/dev/null \
+          || warn "could not reload/start nginx; start it manually"
       fi
       info "nginx config written to $conf"
       ;;
@@ -511,13 +586,19 @@ EOF
 # --- install -----------------------------------------------------------------
 cmd_install() {
   preflight
-  # Existing install guard (fixes duplicate-install footgun).
-  if [ -f "$CONFIG_FILE" ]; then
+  # Existing install guard. A server.env with the 'complete' marker means a full
+  # install already finished -> refuse and point at 'upgrade'. A server.env
+  # WITHOUT the marker means a previous run died halfway -> resume idempotently.
+  if [ -f "$CONFIG_FILE" ] && install_complete; then
     die "existing installation found ($CONFIG_FILE). Use 'upgrade' instead." 2
+  fi
+  if [ -f "$CONFIG_FILE" ]; then
+    info "Found incomplete installation at $CONFIG_FILE; resuming from where it stopped"
   fi
   # Install missing packages right after preflight, BEFORE any network use
   # (curl/git below depend on them). On a minimal Debian this fixes
-  # "curl: command not found".
+  # "curl: command not found". For --tls nginx|caddy this also installs the
+  # proxy so it exists before its config is written.
   install_packages
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "== install plan =="
@@ -530,45 +611,37 @@ cmd_install() {
     plan "symlink $INSTALL_DIR/current -> $r"
     write_env
     render_units
+    # Verification of the data plane is planned BEFORE the proxy step, so a TLS
+    # failure can never hide a missing/backup-less install.
+    plan "verify data plane: service active, /health, discovery, first backup quick_check"
     setup_tls
+    plan "mark install complete (write $STATE_FILE)"
     echo "== end of plan (nothing changed) =="
     return 0
   fi
   resolve_node
   install_node
   setup_dirs
-  # Install order for a real run.
+  # Install order for a real run. The release + symlink + env + units are
+  # idempotent, so a resume re-runs them safely.
   local r v; read -r r v < <(build_release "${VERSION_TAG:-}")
   [ -n "$r" ] || die "internal: empty release dir from build_release" 1
   ln -sfn "$r" "$INSTALL_DIR/current"
   # Symlink target ownership is handled inside build_release on the real dir.
   write_env
   render_units
-  setup_tls
-  # Verification (hard). Skip in --root.
+  # Verify the data plane BEFORE any proxy/TLS work. This ordering guarantees a
+  # TLS failure cannot hide that the service or backup never got stood up, and
+  # keeps `apt`/proxy breakage from masking missing backups.
   if [ -n "$ROOT_PREFIX" ]; then
     info "Test mode: skipping live service/health verification"
   else
-    sleep 2
-    if ! systemctl is-active --quiet silique.service; then
-      die "silique.service did not reach 'active' state" 1
-    fi
-    verify_health
-    if [ "$NO_BACKUP_TIMER" -eq 0 ]; then
-      # Run one backup now and check it passes quick_check.
-      systemctl start silique-backup.service || die "backup service failed" 1
-      local newest; newest="$(ls -1t "$BACKUPS_DIR"/silique-*.sqlite 2>/dev/null | head -1)"
-      [ -n "$newest" ] || die "no backup file produced" 1
-      local qc
-      if command -v sqlite3 >/dev/null 2>&1; then
-        qc="$(sqlite3 "$newest" 'PRAGMA quick_check;' 2>/dev/null)"
-      else
-        qc="$("$NODE" --input-type=module -e "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[1]);console.log(d.prepare('PRAGMA quick_check').get().quick_check);d.close();" "$newest")"
-      fi
-      [ "$qc" = "ok" ] || die "backup quick_check != ok (got: $qc)" 1
-      info "Backup verified: quick_check=ok"
-    fi
+    verify_data_plane
   fi
+  # TLS is set up only after the data plane is confirmed working.
+  setup_tls
+  # Only now is the install genuinely complete.
+  mark_complete
   summary
 }
 
@@ -628,6 +701,11 @@ cmd_status() {
   echo "install-dir: $INSTALL_DIR"
   echo "current:     $cur"
   [ -f "$CONFIG_FILE" ] && echo "env:         $CONFIG_FILE" || echo "env:         (missing)"
+  if install_complete; then
+    echo "install:     complete"
+  else
+    echo "install:     incomplete (re-run 'install' to resume)"
+  fi
   if [ -n "$ROOT_PREFIX" ]; then
     echo "service:     n/a (--root test mode)"
     return 0
@@ -655,6 +733,7 @@ cmd_uninstall() {
     rm -rf "$ROOT_PREFIX/etc/systemd/system/silique.service" \
            "$ROOT_PREFIX/etc/systemd/system/silique-backup.service" \
            "$ROOT_PREFIX/etc/systemd/system/silique-backup.timer"
+    rm -f "$STATE_FILE"
   else
     is_root || die "must run as root to uninstall" 1
     systemctl disable --now silique.service 2>/dev/null || true
@@ -662,6 +741,7 @@ cmd_uninstall() {
     rm -f "$UNIT_DIR/silique.service" "$UNIT_DIR/silique-backup.service" "$UNIT_DIR/silique-backup.timer"
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
+    rm -f "$STATE_FILE"
     userdel "$SILIQUE_USER" 2>/dev/null || true
   fi
   echo "Uninstalled. Database preserved at: $db"
@@ -741,19 +821,36 @@ main() {
     DATA_DIR="$ROOT_PREFIX$DATA_DIR"
     BACKUPS_DIR="$ROOT_PREFIX$BACKUPS_DIR"
     CONFIG_FILE="$ROOT_PREFIX$CONFIG_FILE"
+    STATE_FILE="$ROOT_PREFIX$STATE_FILE"
     UNIT_DIR="$ROOT_PREFIX/etc/systemd/system"
   fi
 
   case "$cmd" in
-    install)      cmd_install ;;
-    upgrade)      cmd_upgrade "$upgrade_arg" ;;
-    backup-now)   cmd_backup_now ;;
-    status)       cmd_status ;;
-    uninstall)    cmd_uninstall ;;
-    help)         usage ;;
+    install)      INSTALL_CMD=install; cmd_install ;;
+    upgrade)      INSTALL_CMD=upgrade; cmd_upgrade "$upgrade_arg" ;;
+    backup-now)   INSTALL_CMD=backup-now; cmd_backup_now ;;
+    status)       INSTALL_CMD=status; cmd_status ;;
+    uninstall)    INSTALL_CMD=uninstall; cmd_uninstall ;;
+    help)         INSTALL_CMD=help; usage ;;
     *)            die "unknown command: $cmd (see 'help')" 2 ;;
   esac
 }
+
+# When `install` fails partway, print what is already in place and exactly how
+# to finish, so a half-done install (server up but no TLS/backup) is never left
+# without a recovery path.
+INSTALL_CMD=""
+install_error_hint() {
+  local code=$?
+  [ "$code" -eq 0 ] && return 0
+  if [ "${INSTALL_CMD:-}" = "install" ] && [ -f "$CONFIG_FILE" ] && ! install_complete; then
+    printf '\nInstall did not finish. Everything completed so far is preserved.\n' >&2
+    printf 'Re-run to resume idempotently:  sudo %s install\n' "$0" >&2
+    printf 'Inspect current state with:     sudo %s status\n' "$0" >&2
+  fi
+  return 0
+}
+trap install_error_hint EXIT
 
 REPO_URL="https://github.com/Haniewicz/silique-self-hosted.git"
 main "$@"
