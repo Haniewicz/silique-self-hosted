@@ -44,6 +44,28 @@ Configuration is read from environment variables: `HOST`, `PORT`, `DATABASE_PATH
 - [Encryption and threat model](docs/security.md)
 - [Self-hosting guide](docs/self-hosting.md)
 
+## Download the app
+
+The Silique client is distributed via the public release repository, where installers
+and signed updates are published:
+
+<https://github.com/Haniewicz/silique-releases/releases/latest>
+
+| Platform | Files from the latest release (`v0.2.45`) |
+| -------- | ------------------------------------------ |
+| macOS    | `Silique-0.2.45-macOS.dmg` |
+| Windows  | `Silique-0.2.45-Setup-Windows-x64.exe`, `Silique-0.2.45-Windows-x64.zip` |
+| Android  | `Silique-0.2.45.apk` |
+| Linux    | `Silique-0.2.45-Linux-GTK4-amd64.deb`, `Silique-0.2.45-Linux-GTK4-x86_64.rpm`, `Silique-0.2.45-Linux-GTK4-x64.tar.gz` |
+
+The app is a single client for both self-hosted and app-managed modes: on first launch
+you enter the address of **your** server (for example `https://notes.example.com`), and
+the account is created from the app — registration closes after the first account.
+
+Both the client and the server are licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE) — commercial use requires a separate
+license. To set up the server, see the [self-hosting guide](docs/self-hosting.md).
+
 ## License
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Use is permitted

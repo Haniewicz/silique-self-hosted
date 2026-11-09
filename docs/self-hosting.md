@@ -3,7 +3,8 @@
 Silique Server is a single-user synchronization server for your encrypted notes.
 You run it on your own Linux host, behind TLS, and connect the Silique app from
 any number of your devices. This guide takes you from a fresh server to a
-running, backed-up, and restorable installation.
+running, backed-up, and restorable installation. To get the client, see the
+[Download the app](../README.md#download-the-app) section of the README.
 
 There are two ways to install:
 
