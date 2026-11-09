@@ -431,6 +431,48 @@ class InstallerTests(unittest.TestCase):
             "guide must install Caddy or point to the Caddy install docs",
         )
 
+    def test_19_guide_has_no_tag_dependency(self):
+        """The guide must not depend on git tags; version comes from package.json."""
+        with open(DOCS) as f:
+            text = f.read()
+        self.assertNotIn("git ls-remote --tags", text,
+                         "guide must not use `git ls-remote --tags`")
+        self.assertNotIn("clone --branch", text,
+                         "guide must not use `git clone --branch`")
+        self.assertRegex(
+            text,
+            r"""require\(["']\./package\.json["']\)\.version""",
+            "guide must read the version from package.json",
+        )
+
+    def test_20_guide_exports_node_path(self):
+        """The install section exports /opt/silique-node/bin before the first npm ci."""
+        with open(DOCS) as f:
+            text = f.read()
+        self.assertIn("export PATH=/opt/silique-node/bin:$PATH", text,
+                      "guide must export /opt/silique-node/bin on PATH")
+        export_idx = text.index("export PATH=/opt/silique-node/bin:$PATH")
+        npm_ci_idx = text.index("npm ci")
+        self.assertLess(
+            export_idx, npm_ci_idx,
+            "PATH export must come before the first `npm ci`",
+        )
+
+    def test_21_guide_upgrade_without_tags(self):
+        """The Updating section must not use --branch and must name package.json or install.sh upgrade."""
+        with open(DOCS) as f:
+            text = f.read()
+        start = text.index("## Updating the server")
+        end = text.index("## Backups", start)
+        updating = text[start:end]
+        self.assertNotIn("--branch", updating,
+                         "Updating section must not use `--branch`")
+        self.assertTrue(
+            ("package.json" in updating)
+            or ("install.sh upgrade" in updating),
+            "Updating section must mention package.json or install.sh upgrade",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

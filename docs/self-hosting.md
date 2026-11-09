@@ -156,7 +156,13 @@ We install into three well-known locations:
 ### 0. Node 24
 
 Follow [Node.js 24](#nodejs-24) above first. The remaining steps assume
-`/opt/silique-node/bin/node` exists.
+`/opt/silique-node/bin/node` exists. The tarball is unpacked into
+`/opt/silique-node/bin`, which is **not** on your `PATH` and does not install
+into `/usr/bin` — so add it to your `PATH` before you call `node`/`npm`:
+
+```sh
+export PATH=/opt/silique-node/bin:$PATH
+```
 
 ### 1. Create the system user
 
@@ -196,23 +202,23 @@ directory itself** — never the `current` symlink, which resolves to whatever i
 currently points at:
 
 ```sh
-VERSION=$(git ls-remote --tags https://github.com/Haniewicz/silique-self-hosted.git \
-  | sed -E 's#.*refs/tags/(v?[0-9][^^{}]*)(\^\{\})?#\1#' | sort -V | tail -1 | sed 's/^v//')
-
 sudo mkdir -p /opt/silique/releases
 sudo chown root:root /opt/silique/releases
 # as root (the build writes into the checkout):
 cd /opt/silique/releases
-sudo git clone --depth 1 --branch "$VERSION" \
-  https://github.com/Haniewicz/silique-self-hosted.git "silique-$VERSION"
-cd "silique-$VERSION"
-# Read the real version from package.json (authoritative):
+# Clone the default branch — no tag is required, releases may not be tagged:
+sudo git clone --depth 1 \
+  https://github.com/Haniewicz/silique-self-hosted.git silique-src
+# Read the version from package.json INSIDE the checkout (the only
+# authoritative source) -- running this from /opt/silique/releases would look
+# for a package.json that is not there:
+cd silique-src
 VERSION_REAL=$(node -p "require('./package.json').version")
-cd /opt/silique/releases
-sudo mv "silique-$VERSION" "silique-$VERSION_REAL"
+cd ..
+sudo mv silique-src "silique-$VERSION_REAL"
 cd "silique-$VERSION_REAL"
-sudo npm ci
-sudo npm run build
+npm ci
+npm run build
 # Own the release directory itself — NOT the symlink.
 sudo chown -R silique:silique "/opt/silique/releases/silique-$VERSION_REAL"
 sudo ln -sfn "/opt/silique/releases/silique-$VERSION_REAL" /opt/silique/current
@@ -527,24 +533,25 @@ and pairing offers.
 ## Updating the server
 
 Updates use a **new release directory + symlink flip**, so you can roll back
-instantly:
+instantly. No git tag is required: clone the default branch and name the new
+release directory from the version in `package.json` — exactly as in
+[Installation](#installation):
 
 ```sh
+export PATH=/opt/silique-node/bin:$PATH
 cd /opt/silique/releases
-sudo git clone --depth 1 --branch <new-version> \
-  https://github.com/Haniewicz/silique-self-hosted.git silique-<new-version>
-cd silique-<new-version>
-# The release directory is named from package.json, not the tag:
+sudo git clone --depth 1 \
+  https://github.com/Haniewicz/silique-self-hosted.git silique-src
+# The release directory is named from package.json, not a tag -- read it from
+# inside the fresh checkout:
+cd silique-src
 VERSION_REAL=$(node -p "require('./package.json').version")
-cd /opt/silique/releases
-# Ensure the name matches the version the server reports:
-if [ "silique-$VERSION_REAL" != "silique-<new-version>" ]; then
-  sudo mv "silique-<new-version>" "silique-$VERSION_REAL"
-fi
+cd ..
+sudo mv silique-src "silique-$VERSION_REAL"
 cd "silique-$VERSION_REAL"
-sudo npm ci
+npm ci
 # dist/ is already in the repo; rebuild only to pick up any changes you made.
-sudo npm run build
+npm run build
 # Own the RELEASE DIRECTORY, not the symlink. Using `chown` on /opt/silique/current
 # would dereference the symlink and re-own the previous release, while the new
 # directory stays root:root.
@@ -565,7 +572,7 @@ sudo systemctl restart silique
 
 > The installer does all of this — including a pre-upgrade backup and an
 > automatic rollback if the new release fails to start — with
-> `sudo ./infra/install.sh upgrade <version>`.
+> `sudo ./infra/install.sh upgrade <version>` (which also needs no tag).
 
 ---
 
