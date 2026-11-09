@@ -297,6 +297,70 @@ setup_dirs() {
 }
 
 # --- Code checkout + build ---------------------------------------------------
+# Run `npm ci` and, when the release has no dist/ yet, `npm run build`, inside
+# $1. On failure, print the tail (~10 lines) of the step's output so the caller's
+# error message (and the user) can see WHY preparation failed, not just that it
+# did. stdout stays clean; everything goes to stderr.
+npm_ci_and_build() {
+  local dir="$1"
+  local log; log="$(mktemp)"
+  if ! ( cd "$dir" && npm ci ) >"$log" 2>&1; then
+    warn "npm ci failed in $dir; last output:"
+    tail -n 10 "$log" >&2
+    rm -f "$log"
+    return 1
+  fi
+  if [ ! -d "$dir/dist" ]; then
+    info "dist/ not present; building"
+    if ! ( cd "$dir" && npm run build ) >"$log" 2>&1; then
+      warn "npm run build failed in $dir; last output:"
+      tail -n 10 "$log" >&2
+      rm -f "$log"
+      return 1
+    fi
+  fi
+  rm -f "$log"
+  return 0
+}
+
+# Build a release from an existing source directory (the `upgrade <dir>` form).
+# Copies the source into a versioned release dir under releases/ (leaving the
+# source untouched), runs npm ci (+ build if no dist/), and owns the release dir
+# -- exactly the same treatment the git-checkout path gives a release. Echoes
+# "<release_dir> <version>" on stdout.
+build_release_from_dir() {
+  local src="$1"
+  local release_dir version
+  [ -d "$src" ] || die "source directory not found: $src" 1
+  version="$(pick_version "$src")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    release_dir="$INSTALL_DIR/releases/silique-$version"
+    plan "copy $src -> $release_dir"
+    plan "npm ci && npm run build in $release_dir"
+    plan "chown -R $SILIQUE_USER:$SILIQUE_USER $release_dir"
+    printf '%s %s\n' "$release_dir" "$version"
+    return 0
+  fi
+  release_dir="$INSTALL_DIR/releases/silique-$version"
+  # Guard against pointing at the release dir itself (degenerate `upgrade
+  # releases/silique-X`), which would copy it onto itself.
+  if [ "$(cd -P "$src" 2>/dev/null && pwd)" = "$(cd -P "$release_dir" 2>/dev/null && pwd 2>/dev/null)" ]; then
+    printf '%s %s\n' "$release_dir" "$version"
+    return 0
+  fi
+  rm -rf "$release_dir"
+  mkdir -p "$release_dir"
+  cp -a "$src"/. "$release_dir"/ || die "failed to copy $src to $release_dir" 1
+  info "Preparing release from $src (version $version)"
+  npm_ci_and_build "$release_dir" || die "npm ci/build failed" 1
+  if [ -n "$ROOT_PREFIX" ]; then
+    chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir" 2>/dev/null || true
+  else
+    chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir"
+  fi
+  printf '%s %s\n' "$release_dir" "$version"
+}
+
 build_release() {
   # $1 = version tag (optional -> latest). Echoes "release_dir version" to stdout.
   local tag="$1"
@@ -339,11 +403,7 @@ build_release() {
   release_dir="$INSTALL_DIR/releases/silique-$version"
   rm -rf "$release_dir"
   mv "$tmp" "$release_dir"
-  ( cd "$release_dir" && npm ci ) >&2 || die "npm ci failed" 1
-  if [ ! -d "$release_dir/dist" ]; then
-    info "dist/ not present; building"
-    ( cd "$release_dir" && npm run build ) >&2 || die "npm run build failed" 1
-  fi
+  npm_ci_and_build "$release_dir" || die "npm ci/build failed" 1
   # Own the release directory itself (NOT the future symlink) -- fixes #4.
   if [ -n "$ROOT_PREFIX" ]; then
     chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir" 2>/dev/null || true
@@ -425,6 +485,20 @@ render_units() {
 }
 
 # --- verification ------------------------------------------------------------
+# Capture the reason a failed service is down: the last lines of `systemctl
+# status silique` (falling back to a short journalctl window). Kept to ~10 lines
+# so the user sees WHY without a wall of log.
+service_failure_detail() {
+  local detail=""
+  if command -v systemctl >/dev/null 2>&1; then
+    detail="$(systemctl status silique.service 2>&1 | tail -n 10)"
+  fi
+  if [ -z "$detail" ] && command -v journalctl >/dev/null 2>&1; then
+    detail="$(journalctl -u silique -n 20 --no-pager 2>&1 | tail -n 10)"
+  fi
+  printf '%s' "$detail"
+}
+
 verify_health() {
   local base="http://$HOST:$PORT"
   local health discovery
@@ -658,7 +732,7 @@ cmd_upgrade() {
   [ -L "$INSTALL_DIR/current" ] && old="$(readlink -f "$INSTALL_DIR/current")"
   local r v
   if [ -d "$arg" ]; then
-    r="$arg"; v="$(pick_version "$r")"
+    read -r r v < <(build_release_from_dir "$arg")
   else
     read -r r v < <(build_release "${arg:-${VERSION_TAG:-}}")
   fi
@@ -679,6 +753,9 @@ cmd_upgrade() {
     info "Upgrade to $v succeeded"
   else
     warn "new release failed; rolling back"
+    # Tell the user WHY it failed (the last lines of the service status), not
+    # just that it did.
+    warn "$(service_failure_detail)"
     if [ -n "$old" ]; then
       ln -sfn "$old" "$INSTALL_DIR/current"
       systemctl restart silique.service

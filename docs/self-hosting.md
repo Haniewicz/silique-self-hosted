@@ -573,6 +573,8 @@ sudo systemctl restart silique
 > The installer does all of this — including a pre-upgrade backup and an
 > automatic rollback if the new release fails to start — with
 > `sudo ./infra/install.sh upgrade <version>` (which also needs no tag).
+> `upgrade` accepts a git tag, a local source directory, or (with no argument)
+> the latest HEAD.
 
 ---
 

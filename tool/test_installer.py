@@ -9,6 +9,7 @@ fails. The adapter runs this via `npm run test:all`.
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -471,6 +472,85 @@ class InstallerTests(unittest.TestCase):
             ("package.json" in updating)
             or ("install.sh upgrade" in updating),
             "Updating section must mention package.json or install.sh upgrade",
+        )
+
+    def _write_minimal_release(self, dest, version, build_body):
+        """Write a minimal, offline-installable release tree (zero-dependency
+        package.json + matching lockfile with no node_modules/dist). `build_body`
+        is the shell body of the `build` script (e.g. to create dist/ or to fail)."""
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "package.json"), "w") as f:
+            f.write(
+                '{"name":"silique-server","version":"%s",'
+                '"scripts":{"build":%s}}' % (version, json.dumps(build_body))
+            )
+        with open(os.path.join(dest, "package-lock.json"), "w") as f:
+            f.write(
+                '{"name":"silique-server","version":"%s","lockfileVersion":3,'
+                '"requires":true,"packages":{"":{"name":"silique-server",'
+                '"version":"%s","license":"UNLICENSED"}}}' % (version, version)
+            )
+
+    def test_22_upgrade_dir_prepares_release(self):
+        """upgrade <dir> copies into releases/, runs npm ci/build; source untouched."""
+        self.do_install()
+        current = os.path.join(self.root, "opt", "silique", "current")
+
+        # Source dir WITHOUT dist/ or node_modules, outside releases/.
+        src = os.path.join(self.tmp, "source-release")
+        self._write_minimal_release(
+            src, "9.9.9", "mkdir -p dist && echo done > dist/index.js"
+        )
+        self.assertFalse(os.path.exists(os.path.join(src, "dist")))
+        self.assertFalse(os.path.exists(os.path.join(src, "node_modules")))
+
+        run_installer("upgrade", src, *self.base)
+
+        target = os.path.realpath(current)
+        releases = os.path.join(self.root, "opt", "silique", "releases")
+        self.assertTrue(
+            target.startswith(releases + os.sep),
+            f"current must point into releases/, got {target}",
+        )
+        # The symlink must NOT point at the untouched source dir.
+        self.assertNotEqual(
+            os.path.realpath(target), os.path.realpath(src),
+            "current must point at the prepared copy, not the source dir",
+        )
+        # The freshly built dist/ (or installed node_modules) must be present.
+        self.assertTrue(
+            os.path.isdir(os.path.join(target, "dist"))
+            or os.path.isdir(os.path.join(target, "node_modules")),
+            "release dir must contain dist/ or node_modules after preparation",
+        )
+        # Source dir stays untouched (no dist/ or node_modules written into it).
+        self.assertFalse(os.path.exists(os.path.join(src, "dist")))
+        self.assertFalse(os.path.exists(os.path.join(src, "node_modules")))
+
+    def test_23_upgrade_failure_reports_cause(self):
+        """A failed release preparation must be reported and leave current intact."""
+        self.do_install()
+        current = os.path.join(self.root, "opt", "silique", "current")
+        prev_target = os.path.realpath(current)
+
+        # Source with a valid package.json (so version resolution passes) whose
+        # build step fails -- preparation fails only after npm ci is attempted.
+        src = os.path.join(self.tmp, "broken-release")
+        self._write_minimal_release(
+            src, "9.9.8", "echo BUILD_PREP_FAIL_MARKER ; exit 1"
+        )
+
+        rc, out, err = run_installer("upgrade", src, *self.base, expect=None)
+        self.assertNotEqual(rc, 0, "upgrade of a broken source must fail")
+        combined = out + err
+        # The error must name the cause (the failing step's output), not just
+        # "new release failed".
+        self.assertIn("BUILD_PREP_FAIL_MARKER", combined,
+                      "failure message must include the build step's output")
+        # The symlink must still point at the previous release.
+        self.assertEqual(
+            os.path.realpath(current), os.path.realpath(prev_target),
+            "current symlink must remain on the previous release after failure",
         )
 
 
