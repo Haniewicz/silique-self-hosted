@@ -6,9 +6,12 @@ Type=oneshot
 User=silique
 Group=silique
 UMask=0077
-EnvironmentFile=/etc/silique/server.env
-ExecStart=/opt/silique-node/bin/node /opt/silique/current/infra/backup/backup.mjs /var/backups/silique
+EnvironmentFile=@CONFIG@
+ExecStart=@NODE@ @WORKDIR@/infra/backup/backup.mjs @BACKUPS_DIR@
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/silique /var/backups/silique
+ReadWritePaths=@DATA_DIR@ @BACKUPS_DIR@
+
+[Install]
+WantedBy=multi-user.target

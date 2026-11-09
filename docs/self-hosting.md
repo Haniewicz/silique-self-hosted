@@ -5,6 +5,15 @@ You run it on your own Linux host, behind TLS, and connect the Silique app from
 any number of your devices. This guide takes you from a fresh server to a
 running, backed-up, and restorable installation.
 
+There are two ways to install:
+
+- **[Quick install](#quick-install)** — a single command (`infra/install.sh`) that
+  provisions Node 24, the code, the `silique` user, directories, systemd units and
+  backups for you.
+- **[Manual install](#installation)** — the step-by-step path below, for people who
+  want to see and control every file and command. The installer does exactly these
+  steps, minus the mistakes this guide once had.
+
 > **Single-user by design.** There is exactly **one account**. The first account
 > is created from the app the first time it connects (see
 > [First application launch](#first-application-launch)); immediately after,
@@ -13,33 +22,121 @@ running, backed-up, and restorable installation.
 
 ---
 
+## Quick install
+
+`infra/install.sh` installs everything into the same well-known locations the
+manual guide uses (`/opt/silique`, `/etc/silique/server.env`, `/var/lib/silique`,
+`/var/backups/silique`), creates the `silique` system user, downloads and verifies
+Node 24 to `/opt/silique-node`, builds the current release, renders the systemd
+units with the correct paths, and immediately verifies that the service is
+`active`, `/health` answers `{"status":"ok","protocol":1}` and the first backup
+passes `PRAGMA quick_check`.
+
+```sh
+# Grab the repository and run the installer as root.
+git clone https://github.com/Haniewicz/silique-self-hosted.git
+cd silique-self-hosted
+sudo ./infra/install.sh install
+```
+
+With a domain and automatic HTTPS (Caddy):
+
+```sh
+sudo ./infra/install.sh install --domain notes.example.com --tls caddy
+```
+
+The server stays on `127.0.0.1:8787` unless you pass `--tls`. Create your account
+from the Silique app afterwards, then manage the server with:
+
+```sh
+sudo ./infra/install.sh status
+sudo ./infra/install.sh backup-now
+sudo ./infra/install.sh upgrade <version>
+```
+
+> `./infra/install.sh help` lists every subcommand and flag, including
+> `--self-signed`, `--no-backup-timer`, `--node-bin <path>` (use your own Node) and
+> `--dry-run`. Prefer the [manual path](#installation) if you want to audit each
+> step yourself.
+
+---
+
 ## Table of contents
 
-1. [Requirements](#requirements)
-2. [Installation](#installation)
-3. [Configuration](#configuration)
-4. [Running as a systemd service](#running-as-a-systemd-service)
-5. [Reverse proxy and TLS](#reverse-proxy-and-tls)
-6. [First application launch](#first-application-launch)
-7. [Adding more devices](#adding-more-devices)
-8. [Updating the server](#updating-the-server)
-9. [Backups](#backups)
-10. [Restoring a backup](#restoring-a-backup)
-11. [Troubleshooting](#troubleshooting)
+1. [Quick install](#quick-install)
+2. [Requirements](#requirements)
+3. [Installation](#installation)
+4. [Configuration](#configuration)
+5. [Running as a systemd service](#running-as-a-systemd-service)
+6. [Reverse proxy and TLS](#reverse-proxy-and-tls)
+7. [First application launch](#first-application-launch)
+8. [Adding more devices](#adding-more-devices)
+9. [Updating the server](#updating-the-server)
+10. [Backups](#backups)
+11. [Restoring a backup](#restoring-a-backup)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Requirements
 
-- **Linux** (a bare server or a VPS; tested on Debian and Ubuntu).
+- **Linux** (a bare server or a VPS; tested on Debian 13 and Ubuntu).
 - **Node.js >= 24**. SQLite is provided by the built-in `node:sqlite` module, so
-  **no separate SQLite package or system library is required**.
+  **no separate SQLite package or system library is required** (the `sqlite3` CLI
+  is optional — see [Backups](#backups)).
 - **~1 GB RAM** is enough for a single user. The server keeps everything in
   SQLite and is idle most of the time.
 - **One TCP port** of your choice (the default used throughout this guide is
   `8787`) reachable from the reverse proxy on the same host.
 - A **domain name** (or a public IP) for TLS, plus outbound access to a
-  certificate authority if you use Caddy or a webroot ACME client.
+  certificate authority if you use Caddy or a webroot ACME client. A LAN-only or
+  self-signed setup without a domain is covered in
+  [Reverse proxy and TLS](#reverse-proxy-and-tls).
+
+### Packages on a fresh Debian 13
+
+A minimal Debian 13 image does not ship `curl`, `git`, `gnupg` or
+`ca-certificates`. Install them before you begin:
+
+| Package           | Why                                          |
+| ----------------- | -------------------------------------------- |
+| `curl`            | download the Node.js tarball and checksums   |
+| `ca-certificates` | trust the nodejs.org TLS certificate         |
+| `git`             | clone the server release                     |
+| `gnupg`           | verify keys for third-party/apt use          |
+
+```sh
+sudo apt-get update
+sudo apt-get install -y curl ca-certificates git gnupg
+```
+
+(The installer `infra/install.sh` installs these automatically via
+`apt-get install -y` when it detects they are missing.)
+
+### Node.js 24
+
+The systemd units launch Node from **`/opt/silique-node/bin/node`**. Install the
+official Node 24 there — the same way the installer does — so the units work
+unchanged:
+
+```sh
+# Determine the architecture: x64 or arm64.
+ARCH=x64   # use arm64 on aarch64 machines
+cd /tmp
+curl -fsSLo SHASUMS256.txt "https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt"
+# Pick the actual node-v24.x.y-linux-<arch>.tar.xz shipped under latest-v24.x.
+TARBALL=$(awk '{print $2}' SHASUMS256.txt \
+  | grep -E "^node-v24\.[0-9]+\.[0-9]+-linux-${ARCH}\.tar\.xz$" | head -1)
+curl -fsSLo "$TARBALL" "https://nodejs.org/dist/latest-v24.x/$TARBALL"
+grep "  ${TARBALL}$" SHASUMS256.txt | sha256sum -c -
+sudo mkdir -p /opt/silique-node
+sudo tar -xJf "$TARBALL" -C /opt/silique-node --strip-components=1
+/opt/silique-node/bin/node -v   # must print v24.x
+```
+
+If you already have Node 24 somewhere else, point the units at it instead (see
+[Running as a systemd service](#running-as-a-systemd-service), or pass
+`--node-bin <path>` to the installer).
 
 ---
 
@@ -52,6 +149,11 @@ We install into three well-known locations:
 | `/opt/silique/current`| The code (a symlink to a release directory)    |
 | `/var/lib/silique`    | The SQLite database (private, mode `0700`)      |
 | `/etc/silique/server.env` | Environment configuration               |
+
+### 0. Node 24
+
+Follow [Node.js 24](#nodejs-24) above first. The remaining steps assume
+`/opt/silique-node/bin/node` exists.
 
 ### 1. Create the system user
 
@@ -73,24 +175,44 @@ sudo chown silique:silique /var/lib/silique
 sudo chmod 0700 /var/lib/silique
 ```
 
-### 3. Install the code
-
-The server ships a `dist/` build compiled from TypeScript, so we build it after
-installing dependencies (never run `npm install` on a server — use `npm ci`) and
-place the release under a versioned directory:
+Create the **backups directory now** too, with the same ownership and mode, so
+the backup timer (which runs as `User=silique`) can write on its first nightly
+run instead of failing with `unable to open database file`:
 
 ```sh
+sudo install -d -o silique -g silique -m 0700 /var/backups/silique
+```
+
+### 3. Install the code
+
+The server ships a `dist/` build compiled from TypeScript, so **`dist/` is already
+in the checkout** — you still run `npm run build` once to be safe, but a
+first-time release only needs `npm ci`. The release directory is named after the
+version reported by `package.json`, and the `silique` user must own **the release
+directory itself** — never the `current` symlink, which resolves to whatever it
+currently points at:
+
+```sh
+VERSION=$(git ls-remote --tags https://github.com/Haniewicz/silique-self-hosted.git \
+  | sed -E 's#.*refs/tags/(v?[0-9][^^{}]*)(\^\{\})?#\1#' | sort -V | tail -1 | sed 's/^v//')
+
 sudo mkdir -p /opt/silique/releases
-sudo chown -R root:root /opt/silique/releases
+sudo chown root:root /opt/silique/releases
 # as root (the build writes into the checkout):
 cd /opt/silique/releases
-git clone https://github.com/Haniewicz/silique-self-hosted silique-0.2.45
-cd silique-0.2.45
-npm ci
-npm run build
-cd /opt/silique
-sudo ln -sfn /opt/silique/releases/silique-0.2.45 current
-sudo chown -R silique:silique /opt/silique/current
+sudo git clone --depth 1 --branch "$VERSION" \
+  https://github.com/Haniewicz/silique-self-hosted.git "silique-$VERSION"
+cd "silique-$VERSION"
+# Read the real version from package.json (authoritative):
+VERSION_REAL=$(node -p "require('./package.json').version")
+cd /opt/silique/releases
+sudo mv "silique-$VERSION" "silique-$VERSION_REAL"
+cd "silique-$VERSION_REAL"
+sudo npm ci
+sudo npm run build
+# Own the release directory itself — NOT the symlink.
+sudo chown -R silique:silique "/opt/silique/releases/silique-$VERSION_REAL"
+sudo ln -sfn "/opt/silique/releases/silique-$VERSION_REAL" /opt/silique/current
 ```
 
 The running entrypoint is `dist/src/index.js` (that is the path the systemd unit
@@ -137,6 +259,23 @@ There is **no** initial password to pre-set: the account (email, password and an
 encryption **recovery key**) is established interactively by the app the first
 time it connects. See [First application launch](#first-application-launch).
 
+### Creating the account from the CLI / CI (fallback only)
+
+`README.md` documents an alternate way to create the account:
+
+```sh
+SILIQUE_INITIAL_PASSWORD='at-least-12-characters' npm run admin -- create-user user@example.com
+```
+
+Treat this as a **fallback / CI bootstrap path only**. It creates the account
+row, but **it does not set up the account key envelope** — the created account
+has `accountEnvelope: null`, which means there is **no Account Master Key
+envelope and no recovery key**. Every paired device is bootstrapped from the
+encryption keys the *app* establishes during registration or login; an account
+created this way cannot be paired or recovered normally. Prefer first-account
+creation from the app, and use `admin create-user` only where you must seed a
+throwaway/CI account and understand the key-envelope limitation.
+
 ---
 
 ## Running as a systemd service
@@ -158,8 +297,11 @@ mode `0700` if needed) and `UMask=0077`, and only permits writes inside
 /opt/silique-node/bin/node /opt/silique/current/dist/src/index.js
 ```
 
-> If your Node.js is installed elsewhere, adjust the `ExecStart` path to your
-> `node` binary (confirm with `command -v node`).
+> If your Node.js is installed elsewhere, adjust the `ExecStart` path in
+> `/etc/systemd/system/silique.service` to your `node` binary (confirm with
+> `command -v node`), then `sudo systemctl daemon-reload && sudo systemctl
+> restart silique`. The installer (`infra/install.sh`) renders this path for you
+> from `--node-bin`.
 
 Verify the server is up:
 
@@ -249,6 +391,31 @@ server {
 > auth. Because auth is a bearer header over the origin of the request, the
 > proxy must simply forward the request untouched and terminate TLS itself.
 
+### Option C — LAN / self-signed (no domain)
+
+On a home LAN you may not have a domain. In that case terminate TLS with a
+**self-signed certificate whose SAN covers the server's IP address**, and point
+the app at `https://<IP>`. The app must trust the certificate (import the cert
+into the OS trust store, or accept it once) — a self-signed cert is still
+encryption, just without a public-CA-verified identity.
+
+Generate it:
+
+```sh
+sudo mkdir -p /etc/nginx/silique
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -keyout /etc/nginx/silique/key.pem \
+  -out   /etc/nginx/silique/cert.pem \
+  -subj "/CN=192.168.1.20" \
+  -addext "subjectAltName=IP:192.168.1.20"
+```
+
+Swap the certificate paths in the nginx config above for the self-signed pair,
+keep `server_name` as the IP, and reload nginx. (The installer does this with
+`--tls nginx --self-signed --domain 192.168.1.20`.) Because the cert is not from
+a public CA, each client device must be told to trust it before the Silique app
+can connect.
+
 ---
 
 ## First application launch
@@ -303,13 +470,25 @@ instantly:
 
 ```sh
 cd /opt/silique/releases
-git clone https://github.com/Haniewicz/silique-self-hosted silique-<new-version>
+sudo git clone --depth 1 --branch <new-version> \
+  https://github.com/Haniewicz/silique-self-hosted.git silique-<new-version>
 cd silique-<new-version>
-npm ci
-npm run build
-cd /opt/silique
-sudo ln -sfn /opt/silique/releases/silique-<new-version> current
-sudo chown -R silique:silique /opt/silique/current
+# The release directory is named from package.json, not the tag:
+VERSION_REAL=$(node -p "require('./package.json').version")
+cd /opt/silique/releases
+# Ensure the name matches the version the server reports:
+if [ "silique-$VERSION_REAL" != "silique-<new-version>" ]; then
+  sudo mv "silique-<new-version>" "silique-$VERSION_REAL"
+fi
+cd "silique-$VERSION_REAL"
+sudo npm ci
+# dist/ is already in the repo; rebuild only to pick up any changes you made.
+sudo npm run build
+# Own the RELEASE DIRECTORY, not the symlink. Using `chown` on /opt/silique/current
+# would dereference the symlink and re-own the previous release, while the new
+# directory stays root:root.
+sudo chown -R silique:silique "/opt/silique/releases/silique-$VERSION_REAL"
+sudo ln -sfn "/opt/silique/releases/silique-$VERSION_REAL" /opt/silique/current
 sudo systemctl restart silique
 sudo systemctl status silique
 curl -s http://127.0.0.1:8787/health
@@ -319,9 +498,13 @@ Because `current` is a symlink to the versioned directory, a bad release is one
 symlink flip away:
 
 ```sh
-sudo ln -sfn /opt/silique/releases/silique-<previous-version> current
+sudo ln -sfn /opt/silique/releases/silique-<previous-version> /opt/silique/current
 sudo systemctl restart silique
 ```
+
+> The installer does all of this — including a pre-upgrade backup and an
+> automatic rollback if the new release fails to start — with
+> `sudo ./infra/install.sh upgrade <version>`.
 
 ---
 
@@ -342,7 +525,9 @@ DATABASE_PATH=/var/lib/silique/silique.sqlite node /opt/silique/current/infra/ba
 ```
 
 It writes a timestamped file such as
-`/var/backups/silique/silique-2025-11-08T03-20-00.000Z.sqlite`, mode `0700`.
+`/var/backups/silique/silique-2025-11-08T03-20-00.000Z.sqlite`. The file is
+written with mode **`0600`** (the unit sets `UMask=0077`), readable only by the
+`silique` user.
 
 ### Automate with a systemd timer
 
@@ -358,6 +543,21 @@ sudo systemctl list-timers silique-backup.timer
 
 The timer runs daily at 03:20 (with a 10-minute random delay). Edit the timer's
 `OnCalendar=` to taste.
+
+**Run the backup once by hand now** to confirm it works — otherwise a permission
+problem in the destination directory only surfaces on the first night, when
+nobody is watching:
+
+```sh
+sudo systemctl start silique-backup.service
+sudo systemctl status silique-backup.service   # must say: active (exited) / SUCCESS
+sudo ls -l /var/backups/silique/
+```
+
+The unit runs as `User=silique`, so `/var/backups/silique` must already exist and
+be owned by `silique` (see step 2 in [Installation](#installation)). If it is
+`root:root`, the backup fails with `ERR_SQLITE_ERROR errcode 14` (`unable to open
+database file`) even when a manual run as root succeeds.
 
 ### Copy backups off the host
 
@@ -387,10 +587,17 @@ Expected output is a single line:
 ok
 ```
 
-(If you do not have the `sqlite3` CLI, use `node --input-type=module -e
-"import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[1]);console.log(d.prepare('PRAGMA quick_check').get());d.close();"
-<file>` — the DB is SQLite and the built-in `node:sqlite` can open it without any
-external package.)
+If you do not have the `sqlite3` CLI, the DB is SQLite and the built-in
+`node:sqlite` module can open it without any external package:
+
+```sh
+node --input-type=module -e \
+  "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[1]);console.log(d.prepare('PRAGMA quick_check').get());d.close();" \
+  /var/backups/silique/silique-<timestamp>.sqlite
+```
+
+(`npm` users can also install the CLI with `sudo apt-get install -y sqlite3`.
+The server itself never needs the CLI.)
 
 ---
 
@@ -418,6 +625,28 @@ encrypted data, but **not** the recovery key — that lives only with you.
 
 ## Troubleshooting
 
+### `status=203/EXEC` and a 3-second restart loop
+
+Both units fail with `status=203/EXEC` when systemd cannot execute the binary in
+`ExecStart`. This is almost always a **wrong `ExecStart` path** — for example a
+`ExecStart=/opt/silique-node/bin/node` that points at a directory that was never
+created. Fix the path to the real `node` binary (see
+[Node.js 24](#nodejs-24)), run `sudo systemctl daemon-reload`, then
+`sudo systemctl restart silique` (and `silique-backup.service`).
+
+### `ERR_SQLITE_ERROR` / `unable to open database file` (errcode 14) in the backup
+
+The backup unit runs as `User=silique`. If the destination directory
+`/var/backups/silique` does not exist or is not owned by `silique`, the backup
+fails the moment it tries to create the database there — a manual run as root
+works and **masks** the problem until the first nightly run. Create and own it:
+
+```sh
+sudo install -d -o silique -g silique -m 0700 /var/backups/silique
+sudo systemctl start silique-backup.service
+sudo systemctl status silique-backup.service
+```
+
 ### `403` on registration ("account already exists")
 
 The error body reads `single-user server: only one account is allowed`. It
@@ -437,7 +666,9 @@ revoked. Log in again from the app. If a device was removed via
 Check that the reverse proxy terminates TLS correctly, the certificate covers
 the exact hostname the app is configured with, and the app address begins with
 `https://`. A mismatch between the host in the app and the certificate CN/SAN is
-the usual cause.
+the usual cause. For a self-signed LAN setup, make sure the cert's SAN includes
+the server IP and that the client device trusts the cert (see
+[Option C](#option-c--lan--self-signed-no-domain)).
 
 ### The app cannot reach the server
 

@@ -6,9 +6,9 @@ After=network.target
 Type=simple
 User=silique
 Group=silique
-WorkingDirectory=/opt/silique/current
-EnvironmentFile=/etc/silique/server.env
-ExecStart=/opt/silique-node/bin/node /opt/silique/current/dist/src/index.js
+WorkingDirectory=@WORKDIR@
+EnvironmentFile=@CONFIG@
+ExecStart=@NODE@ @WORKDIR@/dist/src/index.js
 Restart=on-failure
 RestartSec=3
 UMask=0077
@@ -22,7 +22,7 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/silique
+ReadWritePaths=@DATA_DIR@
 
 [Install]
 WantedBy=multi-user.target

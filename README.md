@@ -22,12 +22,20 @@ npm run build
 npm start
 ```
 
-The API listens on `127.0.0.1:8787` by default. On first start, create the single
-account (the password is passed through the environment, never as a command argument):
+The API listens on `127.0.0.1:8787` by default. The single account is normally
+created from the Silique app on first launch (the app also sets up the account
+key envelope and recovery key). For CI/throwaway bootstrapping only, you can
+seed the account row from the CLI — the password is passed through the
+environment, never as a command argument:
 
 ```sh
 SILIQUE_INITIAL_PASSWORD='at-least-12-characters' npm run admin -- create-user user@example.com
 ```
+
+> **Note:** `admin create-user` creates the account **without** an account key
+> envelope (`accountEnvelope: null`), so the account has no Account Master Key
+> envelope and no recovery key. Prefer account creation from the app; see the
+> [self-hosting guide](docs/self-hosting.md) for details.
 
 Configuration is read from environment variables: `HOST`, `PORT`, `DATABASE_PATH`,
 `CORS_ORIGINS`.

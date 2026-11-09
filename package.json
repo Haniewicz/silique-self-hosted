@@ -12,6 +12,7 @@
     "build": "tsc",
     "start": "node dist/src/index.js",
     "test": "tsx --test tests/*.test.ts",
+    "test:all": "npm test && python3 tool/test_installer.py",
     "check": "tsc --noEmit",
     "admin": "tsx src/admin.ts"
   },
