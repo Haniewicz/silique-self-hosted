@@ -6,3 +6,5 @@ data/
 coverage/
 .DS_Store
 .tmp-e2e/
+__pycache__/
+*.pyc

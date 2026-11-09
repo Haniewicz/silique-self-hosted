@@ -109,23 +109,33 @@ node_major() { "$1" -v 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/'; }
 node_is_24() { [ "$(node_major "$1")" -ge 24 ] 2>/dev/null; }
 
 resolve_node() {
-  # Returns NODE (absolute path) and NODE_DIR.
+  # Returns NODE (absolute path) and NODE_DIR, and puts NODE's directory on PATH
+  # so later bare `node`/`npm` invocations resolve to the same toolchain instead
+  # of whatever happens to be on PATH (fixes "npm: command not found" on hosts
+  # where Node lives under /opt/silique-node).
   if [ -n "$NODE_BIN" ]; then
     if [ -x "$NODE_BIN" ]; then NODE="$NODE_BIN"
     elif command -v "$NODE_BIN" >/dev/null 2>&1; then NODE="$(command -v "$NODE_BIN")"
     else die "node binary not found: $NODE_BIN" 1; fi
     node_is_24 "$NODE" || die "node must be >= 24 (got $($NODE -v)): $NODE" 1
     NODE_DIR="$(cd -P "$(dirname "$NODE")/.." >/dev/null 2>&1 && pwd)"
-    return 0
+  else
+    # Managed node under NODE_DIR.
+    NODE="$NODE_DIR/bin/node"
   fi
-  # Managed node under NODE_DIR.
-  local n="$NODE_DIR/bin/node"
-  if [ -x "$n" ] && node_is_24 "$n"; then NODE="$n"; return 0; fi
-  NODE="$n"
+  export PATH="$(dirname "$NODE"):$PATH"
   return 0
 }
 
 install_node() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ -n "$NODE_BIN" ]; then
+      plan "use node binary: $NODE"
+    else
+      plan "download and verify Node 24 -> $NODE_DIR"
+    fi
+    return 0
+  fi
   # When a node binary is provided or already present, nothing to download.
   [ -n "$NODE_BIN" ] && return 0
   local n="$NODE_DIR/bin/node"
@@ -135,10 +145,6 @@ install_node() {
   fi
   if [ -n "$ROOT_PREFIX" ]; then
     die "--root mode requires --node-bin (no network access to download Node)" 1
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    plan "download and verify Node 24 -> $NODE_DIR"
-    return 0
   fi
   local arch
   case "$(uname -m)" in
@@ -168,9 +174,18 @@ install_node() {
 
 # --- Version helpers ---------------------------------------------------------
 pick_version() {
-  # Read package.json version from a checkout directory.
-  [ -f "$1/package.json" ] && node -p "require('$1/package.json').version" 2>/dev/null \
-    || echo "0.0.0"
+  # Read package.json version from a checkout directory using the resolved node
+  # (never a bare path `node`). A missing/unreadable package.json or an
+  # unparseable version is a hard error, not a `0.0.0` fallback (which produced
+  # bogus releases/silique-0.0.0).
+  [ -f "$1/package.json" ] || die "package.json not found in $1" 1
+  local node="${NODE:-}"
+  [ -z "$node" ] && { resolve_node; node="$NODE"; }
+  local v
+  v="$("$node" -p "require('$1/package.json').version" 2>/dev/null)" \
+    || die "failed to read version from $1/package.json" 1
+  [ -n "$v" ] || die "empty version in $1/package.json" 1
+  printf '%s\n' "$v"
 }
 
 latest_tag() {
@@ -184,7 +199,12 @@ latest_tag() {
 preflight() {
   # In --root we skip OS-level checks (no root/systemd/apt).
   if [ -n "$ROOT_PREFIX" ]; then
-    need_cmd node
+    if [ -z "$NODE_BIN" ]; then
+      need_cmd node || die "no node on PATH; pass --node-bin <path> (required in --root mode)" 1
+    else
+      [ -x "$NODE_BIN" ] || command -v "$NODE_BIN" >/dev/null 2>&1 \
+        || die "node binary not found: $NODE_BIN" 1
+    fi
     return 0
   fi
   is_root || die "must run as root (use sudo); for unprivileged testing use --root <prefix>" 1
@@ -205,12 +225,16 @@ preflight() {
 }
 
 install_packages() {
-  [ -z "${NEED_PKGS:-}" ] && return 0
-  if [ -n "$ROOT_PREFIX" ]; then return 0; fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "apt-get install -y $NEED_PKGS"
+    if [ -n "${NEED_PKGS:-}" ]; then
+      plan "apt-get install -y $NEED_PKGS"
+    else
+      plan "install packages: none missing"
+    fi
     return 0
   fi
+  [ -z "${NEED_PKGS:-}" ] && return 0
+  if [ -n "$ROOT_PREFIX" ]; then return 0; fi
   info "Installing missing packages:$NEED_PKGS"
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y $NEED_PKGS
@@ -257,7 +281,7 @@ build_release() {
     printf '%s %s\n' "$release_dir" "$version"
     return 0
   fi
-  if [ -n "$ROOT_PREFIX" ]; then
+  if [ -n "$ROOT_PREFIX" ] && [ "${SILIQUE_TEST_BUILD:-0}" != "1" ]; then
     # No network: copy the in-repo checkout as the "release".
     version="$(pick_version "$REPO_DIR")"
     release_dir="$INSTALL_DIR/releases/silique-$version"
@@ -280,19 +304,28 @@ build_release() {
   local tmp; tmp="$INSTALL_DIR/releases/.clone.$$"
   rm -rf "$tmp"
   info "Cloning ${tag:-HEAD} from $REPO_URL"
-  git clone "${clone_args[@]}" "$REPO_URL" "$tmp" || die "git clone failed" 1
+  git clone "${clone_args[@]}" "$REPO_URL" "$tmp" >&2 || die "git clone failed" 1
   # Version comes from package.json, NOT the directory/tag name (fixes #7).
   version="$(pick_version "$tmp")"
   release_dir="$INSTALL_DIR/releases/silique-$version"
   rm -rf "$release_dir"
   mv "$tmp" "$release_dir"
-  ( cd "$release_dir" && npm ci ) || die "npm ci failed" 1
+  ( cd "$release_dir" && npm ci ) >&2 || die "npm ci failed" 1
   if [ ! -d "$release_dir/dist" ]; then
     info "dist/ not present; building"
-    ( cd "$release_dir" && npm run build ) || die "npm run build failed" 1
+    ( cd "$release_dir" && npm run build ) >&2 || die "npm run build failed" 1
   fi
   # Own the release directory itself (NOT the future symlink) -- fixes #4.
-  chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir"
+  if [ -n "$ROOT_PREFIX" ]; then
+    chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir" 2>/dev/null || true
+  else
+    chown -R "$SILIQUE_USER":"$SILIQUE_USER" "$release_dir"
+  fi
+  # Ensure release_dir is non-empty so a bad checkout cannot yield a dangling
+  # symlink (mirrors the old "empty r" footgun at the call site).
+  [ -n "$release_dir" ] || die "internal: empty release dir" 1
+  # Single stdout line carrying exactly "<release_dir> <version>"; the caller
+  # reads it with `read -r r v`. Never let git/npm chatter leak onto stdout.
   printf '%s %s\n' "$release_dir" "$version"
 }
 
@@ -482,14 +515,18 @@ cmd_install() {
   if [ -f "$CONFIG_FILE" ]; then
     die "existing installation found ($CONFIG_FILE). Use 'upgrade' instead." 2
   fi
+  # Install missing packages right after preflight, BEFORE any network use
+  # (curl/git below depend on them). On a minimal Debian this fixes
+  # "curl: command not found".
+  install_packages
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "== install plan =="
     [ -n "$ROOT_PREFIX" ] && plan "test mode: root prefix $ROOT_PREFIX"
-    preflight
     resolve_node
     install_node
     setup_dirs
-    local r v; read -r r v < <(build_release "${VERSION_TAG:-}")
+    local r v
+    read -r r v < <(build_release "${VERSION_TAG:-}")
     plan "symlink $INSTALL_DIR/current -> $r"
     write_env
     render_units
@@ -502,12 +539,12 @@ cmd_install() {
   setup_dirs
   # Install order for a real run.
   local r v; read -r r v < <(build_release "${VERSION_TAG:-}")
+  [ -n "$r" ] || die "internal: empty release dir from build_release" 1
   ln -sfn "$r" "$INSTALL_DIR/current"
   # Symlink target ownership is handled inside build_release on the real dir.
   write_env
   render_units
   setup_tls
-  install_packages
   # Verification (hard). Skip in --root.
   if [ -n "$ROOT_PREFIX" ]; then
     info "Test mode: skipping live service/health verification"

@@ -10,6 +10,7 @@ fails. The adapter runs this via `npm run test:all`.
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,16 +20,21 @@ import unittest
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALLER = os.path.join(REPO_DIR, "infra", "install.sh")
+DOCS = os.path.join(REPO_DIR, "docs", "self-hosting.md")
 
 
-def run_installer(*args, expect=0):
+def run_installer(*args, expect=0, env=None):
     """Run `bash infra/install.sh <args>` and return (returncode, stdout)."""
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
     proc = subprocess.run(
         ["bash", INSTALLER, *args],
         cwd=REPO_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=full_env,
     )
     if expect is not None and proc.returncode != expect:
         raise AssertionError(
@@ -43,6 +49,36 @@ def node_bin():
     if not node:
         raise AssertionError("node not found on PATH (required for test mode)")
     return node
+
+
+def _write_script(path, body):
+    with open(path, "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write(body)
+        if not body.endswith("\n"):
+            f.write("\n")
+    os.chmod(path, 0o755)
+
+
+# Build a PATH that still provides every standard tool the installer uses
+# (bash, coreutils, …) but has NO `node`/`npm`/`npx` on it, by symlinking all
+# of /usr/bin and /bin into a staging dir, minus the Node binaries. Node/npm are
+# then only reachable through the fake --node-bin directory (or real --node-bin).
+def _make_no_node_path(tmp):
+    staged = os.path.join(tmp, "nodenode-bin")
+    os.makedirs(staged, exist_ok=True)
+    for d in ("/usr/bin", "/bin"):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if name in ("node", "npm", "npx", "corepack"):
+                continue
+            src = os.path.join(d, name)
+            dst = os.path.join(staged, name)
+            if not os.path.islink(dst) and not os.path.exists(dst) \
+                    and (os.path.isfile(src) or os.path.islink(src)):
+                os.symlink(src, dst)
+    return staged
 
 
 class InstallerTests(unittest.TestCase):
@@ -174,6 +210,130 @@ class InstallerTests(unittest.TestCase):
         # Code tree removed.
         inst = os.path.join(self.root, "opt", "silique")
         self.assertFalse(os.path.exists(inst), "uninstall did not remove code dir")
+
+    def test_09_dry_run_plan_order(self):
+        """--dry-run plan lists the package-install step before the Node step."""
+        _, out, err = run_installer(*self.base, "--dry-run")
+        combined = out + err
+        self.assertIn("install packages", combined,
+                      "plan must contain an install-packages step")
+        self.assertIn("node binary", combined,
+                      "plan must contain a Node step")
+        self.assertLess(combined.index("install packages"),
+                        combined.index("node binary"),
+                        "install-packages step must come before the Node step")
+
+    def test_10_npm_resolved_from_node_dir(self):
+        """The installer invokes `npm` from the Node directory (PATH export)."""
+        fake_node = os.path.join(self.tmp, "node")
+        mock_bin = os.path.join(self.tmp, "bin")
+        npm_log = os.path.join(self.tmp, "npm.log")
+        os.makedirs(fake_node)
+        os.makedirs(mock_bin)
+
+        # A node that reports itself as 24.x and answers `-p` with a version.
+        _write_script(os.path.join(fake_node, "node"),
+                      f'if [ "$1" = "-v" ]; then echo v24.0.0; '
+                      f'elif [ "$1" = "-p" ]; then echo 0.2.3; fi')
+        # The npm that must be found in the node directory.
+        _write_script(os.path.join(fake_node, "npm"),
+                      f'echo "$*" >> "{npm_log}"')
+        # A git mock that produces a minimal release tree (and no network).
+        _write_script(os.path.join(mock_bin, "git"),
+                      'if [ "$1" = "ls-remote" ]; then exit 0; fi\n'
+                      'dest="${@: -1}"\n'
+                      'mkdir -p "$dest/dist"\n'
+                      'printf \'{"name":"silique-server","version":"0.2.3"}\' '
+                      '> "$dest/package.json"\n'
+                      'echo ok > "$dest/dist/index.js"')
+
+        # PATH must NOT contain the node dir (only --node-bin points at it) and
+        # must not contain the real node/npm; mock git comes from mock_bin.
+        base_path = _make_no_node_path(self.tmp)
+        env = {
+            "PATH": os.pathsep.join([mock_bin, base_path]),
+            "SILIQUE_TEST_BUILD": "1",
+        }
+        run_installer("--root", self.root,
+                      "--node-bin", os.path.join(fake_node, "node"),
+                      "--version", "0.2.3", env=env)
+
+        self.assertTrue(os.path.isfile(npm_log),
+                        "npm was never invoked by the installer")
+        with open(npm_log) as f:
+            called = f.read().split()
+        self.assertIn("ci", called,
+                      "installer did not run `npm ci` using npm from the node dir")
+
+    def test_11_no_node_on_path_version(self):
+        """Release dir is named from package.json, never a 0.0.0 fallback."""
+        env = {"PATH": _make_no_node_path(self.tmp)}
+        run_installer(*self.base, env=env)
+        releases = os.path.join(self.root, "opt", "silique", "releases")
+        self.assertTrue(os.path.isdir(releases), "releases dir missing")
+        names = os.listdir(releases)
+        self.assertNotIn("silique-0.0.0", names,
+                         "release dir must never be named silique-0.0.0")
+        self.assertTrue(any(n.startswith("silique-") for n in names),
+                        "a versioned release dir must exist")
+
+    def test_12_stdout_contract(self):
+        """git stdout noise must not corrupt the `read -r r v` result."""
+        fake_node = os.path.join(self.tmp, "node")
+        mock_bin = os.path.join(self.tmp, "bin")
+        os.makedirs(fake_node)
+        os.makedirs(mock_bin)
+
+        # A node that reports 24.x and answers `-p` with a version, plus a no-op
+        # npm sitting in the SAME directory (so the PATH export finds it, not the
+        # real npm in /usr/local/bin).
+        _write_script(os.path.join(fake_node, "node"),
+                      f'if [ "$1" = "-v" ]; then echo v24.0.0; '
+                      f'elif [ "$1" = "-p" ]; then echo 0.2.3; fi')
+        _write_script(os.path.join(fake_node, "npm"), "")
+        # git writes an EXTRA line to stdout (the old bug) before creating a real
+        # release tree; build_release must keep stdout to "<dir> <version>".
+        _write_script(os.path.join(mock_bin, "git"),
+                      'echo noise-on-stdout\n'
+                      'if [ "$1" = "ls-remote" ]; then exit 0; fi\n'
+                      'dest="${@: -1}"\n'
+                      'mkdir -p "$dest/dist"\n'
+                      'printf \'{"name":"silique-server","version":"0.2.3"}\' '
+                      '> "$dest/package.json"\n'
+                      'echo ok > "$dest/dist/index.js"')
+        env = {
+            "PATH": os.pathsep.join([
+                mock_bin, _make_no_node_path(self.tmp)]),
+            "SILIQUE_TEST_BUILD": "1",
+        }
+        run_installer("--root", self.root,
+                      "--node-bin", os.path.join(fake_node, "node"),
+                      "--version", "0.2.3", env=env)
+        current = os.path.join(self.root, "opt", "silique", "current")
+        self.assertTrue(os.path.islink(current),
+                        "current must be a symlink")
+        target = os.path.realpath(current)
+        self.assertTrue(os.path.isdir(target),
+                        "current must point to an existing directory")
+        self.assertTrue(os.listdir(target),
+                        "current must point to a non-empty directory")
+
+    def test_13_manual_units_have_no_placeholders(self):
+        """Copyable [Service] blocks in the guide must contain no @ placeholders."""
+        with open(DOCS) as f:
+            text = f.read()
+        # The guide must no longer tell users to `cp` the raw templates.
+        self.assertNotRegex(
+            text,
+            r"cp\s+[^\n]*infra/systemd/silique(?:-backup)?\.service",
+            "guide must not instruct copying the template .service files verbatim",
+        )
+        # Every ```-fenced [Service] block is a copyable unit; none may contain '@'.
+        for block in re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.DOTALL):
+            if "[Service]" in block and "@" in block:
+                self.fail(
+                    "a copyable unit block contains a placeholder:\n" + block
+                )
 
 
 if __name__ == "__main__":

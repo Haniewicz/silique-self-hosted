@@ -280,10 +280,49 @@ throwaway/CI account and understand the key-envelope limitation.
 
 ## Running as a systemd service
 
-A ready-made unit is included at `infra/systemd/silique.service`. Install it:
+> The files under `infra/systemd/*.service` are **templates** for `install.sh`
+> (they contain `@NODE@`, `@WORKDIR@`, `@CONFIG@`, `@DATA_DIR@` and `@BACKUPS_DIR@`
+> placeholders that the installer substitutes). **Do not copy them verbatim** —
+> systemd cannot run a unit whose `ExecStart` contains a literal `@NODE@` and the
+> service will fail with `status=203/EXEC`. Paste the ready units below instead;
+> they are exactly what `install.sh` renders for the default paths.
+
+Create `/etc/systemd/system/silique.service` with this content:
+
+```ini
+[Unit]
+Description=Silique encrypted synchronization API
+After=network.target
+
+[Service]
+Type=simple
+User=silique
+Group=silique
+WorkingDirectory=/opt/silique/current
+EnvironmentFile=/etc/silique/server.env
+ExecStart=/opt/silique-node/bin/node /opt/silique/current/dist/src/index.js
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=silique
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/silique
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
 
 ```sh
-sudo cp /opt/silique/current/infra/systemd/silique.service /etc/systemd/system/silique.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now silique
 sudo systemctl status silique
@@ -297,7 +336,7 @@ mode `0700` if needed) and `UMask=0077`, and only permits writes inside
 /opt/silique-node/bin/node /opt/silique/current/dist/src/index.js
 ```
 
-> If your Node.js is installed elsewhere, adjust the `ExecStart` path in
+> If your Node.js is installed elsewhere, change the `ExecStart` path in
 > `/etc/systemd/system/silique.service` to your `node` binary (confirm with
 > `command -v node`), then `sudo systemctl daemon-reload && sudo systemctl
 > restart silique`. The installer (`infra/install.sh`) renders this path for you
@@ -531,11 +570,49 @@ written with mode **`0600`** (the unit sets `UMask=0077`), readable only by the
 
 ### Automate with a systemd timer
 
-The repository includes a oneshot service and a timer:
+The repository includes a oneshot service and a timer under `infra/systemd/`.
+As noted in [Running as a systemd service](#running-as-a-systemd-service), the
+`.service` files there are templates — paste these ready units instead (exactly
+what `install.sh` renders for the default paths).
+
+Create `/etc/systemd/system/silique-backup.service`:
+
+```ini
+[Unit]
+Description=Consistent online backup of Silique
+After=silique.service
+[Service]
+Type=oneshot
+User=silique
+Group=silique
+UMask=0077
+EnvironmentFile=/etc/silique/server.env
+ExecStart=/opt/silique-node/bin/node /opt/silique/current/infra/backup/backup.mjs /var/backups/silique
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/silique /var/backups/silique
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create `/etc/systemd/system/silique-backup.timer`:
+
+```ini
+[Unit]
+Description=Daily Silique backup
+[Timer]
+OnCalendar=*-*-* 03:20:00 Europe/Warsaw
+RandomizedDelaySec=10m
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+Then enable the timer:
 
 ```sh
-sudo cp /opt/silique/current/infra/systemd/silique-backup.service /etc/systemd/system/
-sudo cp /opt/silique/current/infra/systemd/silique-backup.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now silique-backup.timer
 sudo systemctl list-timers silique-backup.timer
