@@ -52,11 +52,13 @@ from the Silique app afterwards, then manage the server with:
 ```sh
 sudo ./infra/install.sh status
 sudo ./infra/install.sh backup-now
+sudo ./infra/install.sh renew-cert
 sudo ./infra/install.sh upgrade <version>
 ```
 
 > `./infra/install.sh help` lists every subcommand and flag, including
-> `--self-signed`, `--no-backup-timer`, `--node-bin <path>` (use your own Node) and
+> `--self-signed`, `--cert-days <n>` (self-signed validity, default 3650),
+> `--no-backup-timer`, `--node-bin <path>` (use your own Node) and
 > `--dry-run`. Prefer the [manual path](#installation) if you want to audit each
 > step yourself.
 
@@ -470,7 +472,7 @@ Generate it:
 
 ```sh
 sudo mkdir -p /etc/nginx/silique
-sudo openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout /etc/nginx/silique/key.pem \
   -out   /etc/nginx/silique/cert.pem \
   -subj "/CN=192.168.1.20" \
@@ -479,9 +481,52 @@ sudo openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
 
 Swap the certificate paths in the nginx config above for the self-signed pair,
 keep `server_name` as the IP, and reload nginx. (The installer does this with
-`--tls nginx --self-signed --domain 192.168.1.20`.) Because the cert is not from
+`--tls nginx --self-signed --domain 192.168.1.20`, which defaults to
+`--cert-days 3650`.) Because the cert is not from
 a public CA, each client device must be told to trust it before the Silique app
 can connect.
+
+#### Checking the certificate fingerprint
+
+**The Silique app pins the server's public key, not the certificate.** The
+quantity that matters for trust is the **SPKI** fingerprint (the hash of the
+subjectPublicKeyInfo — i.e. the public key itself):
+
+```sh
+# From the installer (also shows the expiry date and both fingerprints):
+sudo ./infra/install.sh status
+
+# Certificate (SHA-256) fingerprint — changes every time the cert is reissued,
+# even with the same key:
+openssl x509 -noout -fingerprint -sha256 -in /etc/nginx/silique/cert.pem
+
+# SPKI (public-key) fingerprint — the value the app pins; stays the same as long
+# as key.pem is reused:
+openssl x509 -in /etc/nginx/silique/cert.pem -noout -pubkey \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 -binary \
+  | od -An -tx1 | tr -d ' \n'
+```
+
+#### Renewing the certificate
+
+A reissue's timing is a trade-off: leaving it too long risks the cert expiring
+and every device failing to connect; doing it often is harmless but unnecessary.
+With the default `--cert-days 3650` a cert lasts ten years, so renew it when
+`install.sh status` warns (it prints `WARN` when fewer than 14 days remain, and
+an `ERROR` with a nonzero exit once it has expired):
+
+```sh
+sudo ./infra/install.sh renew-cert
+```
+
+`renew-cert` reissues **only `cert.pem`** from the existing `key.pem`, so the
+SPKI (public-key) fingerprint is unchanged and the renewal is **transparent** to
+every already-paired device — no re-trusting is needed. If `key.pem` is missing,
+`renew-cert` generates a fresh key pair and prints a warning that the SPKI
+fingerprint changes: every device must then re-trust the new certificate (re-open
+the server in the app and approve the new cert). To change the key on purpose,
+delete `key.pem` and re-run `renew-cert`.
 
 ---
 

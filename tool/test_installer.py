@@ -575,6 +575,111 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(out.startswith("100755"),
                             f"git index mode must be 100755, got: {out}")
 
+    def test_25_cert_days_flag(self):
+        """--cert-days appears in the plan; 0 and non-integer values exit 2."""
+        _, out, err = run_installer(
+            *self.base, "--dry-run", "--tls", "nginx",
+            "--self-signed", "--domain", "x", "--cert-days", "1234"
+        )
+        self.assertIn("1234", out + err,
+                      "the plan must show the requested --cert-days value")
+
+        rc, _, _ = run_installer(
+            *self.base, "--tls", "nginx", "--self-signed",
+            "--domain", "x", "--cert-days", "0", expect=2
+        )
+        self.assertEqual(rc, 2, "--cert-days 0 must exit 2")
+
+        rc, _, _ = run_installer("--cert-days", "abc", expect=2)
+        self.assertEqual(rc, 2, "--cert-days abc must exit 2")
+
+    def _make_self_signed(self, domain="192.168.1.20"):
+        """Generate a self-signed cert/key pair under the root prefix using
+        openssl directly, so the tests do not depend on nginx being installed
+        (the install --tls nginx path requires the nginx binary)."""
+        certdir = os.path.join(self.root, "etc", "nginx", "silique")
+        os.makedirs(certdir, exist_ok=True)
+        cert = os.path.join(certdir, "cert.pem")
+        key = os.path.join(certdir, "key.pem")
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-days", "3650", "-keyout", key, "-out", cert,
+             "-subj", f"/CN={domain}",
+             "-addext", f"subjectAltName=IP:{domain}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+        return cert, key
+
+    def test_26_status_reports_fingerprint(self):
+        """status prints the SHA-256 and SPKI fingerprints of a self-signed cert."""
+        self._make_self_signed()
+        _, out, err = run_installer("status", *self.base)
+        combined = out + err
+        # SHA-256 cert fingerprint: 64 lowercase hex chars (colon-less).
+        self.assertRegex(
+            combined,
+            r"(?im)^cert-sha256:\s+[0-9a-f]{64}\s*$",
+            "status must print a 64-hex SHA-256 cert fingerprint",
+        )
+        # SPKI fingerprint: same shape.
+        self.assertRegex(
+            combined,
+            r"(?im)^cert-spki:\s+[0-9a-f]{64}\s*$",
+            "status must print a 64-hex SPKI (public-key) fingerprint",
+        )
+        self.assertIn("notAfter", combined,
+                      "status must print the certificate expiry (notAfter)")
+
+    def test_27_renew_keeps_key(self):
+        """renew-cert with an existing key.pem keeps the key, changes the cert."""
+        cert, key = self._make_self_signed()
+
+        def sha(p):
+            with open(p, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        key_before = sha(key)
+        cert_before = sha(cert)
+
+        run_installer("renew-cert", *self.base,
+                      "--domain", "192.168.1.20")
+
+        self.assertEqual(sha(key), key_before,
+                         "renew-cert must not change the private key")
+        self.assertNotEqual(sha(cert), cert_before,
+                            "renew-cert must reissue (change) the cert")
+
+    def test_28_renew_without_key_warns(self):
+        """renew-cert with no key.pem generates a new pair and warns about the pin."""
+        cert, key = self._make_self_signed()
+        os.remove(key)
+
+        _, out, err = run_installer("renew-cert", *self.base,
+                                    "--domain", "192.168.1.20")
+        combined = out + err
+        self.assertTrue(os.path.isfile(key),
+                        "renew-cert must generate a new key.pem when missing")
+        self.assertTrue(os.path.isfile(cert),
+                        "renew-cert must generate cert.pem")
+        self.assertIn("SPKI", combined,
+                      "renew-cert without a key must warn that the SPKI changes")
+        self.assertTrue(
+            "re-trust" in combined or "change" in combined or "confirm" in combined,
+            "the warning must mention re-trusting/re-confirming on devices",
+        )
+
+    def test_29_guide_documents_pinning(self):
+        """The guide documents SPKI and how to read the cert fingerprint."""
+        with open(DOCS) as f:
+            text = f.read()
+        self.assertIn("SPKI", text,
+                      "guide must mention the SPKI (public-key) fingerprint")
+        self.assertIn(
+            "openssl x509 -noout -fingerprint -sha256",
+            text,
+            "guide must show how to read the SHA-256 certificate fingerprint",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

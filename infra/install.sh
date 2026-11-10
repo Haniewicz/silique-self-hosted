@@ -11,7 +11,8 @@
 #   install [opts]         fresh install (default)
 #   upgrade <tag|dir>      build a new release, back up first, flip the symlink
 #   backup-now             run one backup immediately
-#   status                 print installed version and service state
+#   status                 print installed version, service state, cert state
+#   renew-cert             reissue the self-signed cert, keeping the key
 #   uninstall              remove code + units, KEEP the database
 #   help                   this message
 #
@@ -48,6 +49,7 @@ PORT="8787"
 DOMAIN=""
 TLS_MODE="none"
 SELF_SIGNED=0
+CERT_DAYS="3650"
 NO_BACKUP_TIMER=0
 VERSION_TAG=""
 NODE_BIN=""
@@ -84,6 +86,7 @@ Commands:
   upgrade <tag|dir>       Upgrade to a version (tag) or an existing release dir.
   backup-now              Run one backup now.
   status                  Show installation status.
+  renew-cert              Reissue the self-signed cert, keeping the key.
   uninstall               Remove code and units, KEEP data and backups.
   help                    Show this help.
 
@@ -94,6 +97,7 @@ Options:
   --domain <name>         Domain for TLS (required for --tls caddy|nginx).
   --tls none|caddy|nginx  TLS setup (default none: server stays on 127.0.0.1).
   --self-signed           Generate a self-signed cert (with --tls nginx).
+  --cert-days <n>         Validity, in days, for a self-signed cert (default 3650).
   --no-backup-timer       Do not install/enable the backup timer.
   --node-bin <path>       Use this node binary instead of downloading Node 24.
   --yes                   Answer yes to every prompt.
@@ -563,6 +567,85 @@ require_proxy() {
     die "reverse proxy program '$1' not found; install it first (e.g. 'apt-get install -y $1') and re-run this command to resume" 1
 }
 
+# --- certificate helpers ------------------------------------------------------
+# Path to the self-signed cert/key pair. In --root mode everything lives under
+# ROOT_PREFIX; on a real host they are under /etc/nginx/silique.
+ssl_cert_paths() {
+  if [ -n "$ROOT_PREFIX" ]; then
+    CERT_PATH="$ROOT_PREFIX/etc/nginx/silique/cert.pem"
+    KEY_PATH="$ROOT_PREFIX/etc/nginx/silique/key.pem"
+  else
+    CERT_PATH="/etc/nginx/silique/cert.pem"
+    KEY_PATH="/etc/nginx/silique/key.pem"
+  fi
+}
+
+# $1 = cert file. Print the DER-encoded SPKI hash (subjectPublicKeyInfo, i.e. the
+# public key the app pins), in the same colon-less hex form `openssl` prints for
+# a fingerprint. Empty output when the cert is missing/readable.
+spki_fingerprint() {
+  openssl x509 -in "$1" -noout -pubkey 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -binary 2>/dev/null \
+    | od -An -tx1 2>/dev/null \
+    | tr -d ' \t\n'
+}
+
+# $1 = cert file, $2 = grace days. Returns 0 when the cert is still valid with at
+# least "$2" days remaining; nonzero otherwise (missing/unparseable/expired).
+cert_valid() {
+  [ -f "$1" ] || return 1
+  openssl x509 -in "$1" -noout -checkend "$(( $2 * 86400 ))" >/dev/null 2>&1
+}
+
+# $1 = cert file. Print the whole number of days until notAfter (0 once expired).
+# Portable across GNU/BSD date: we rely on `openssl x509 -checkend` stepping, so
+# compute from the seconds-until-expiry that openssl can report via `date`.
+cert_days_left() {
+  [ -f "$1" ] || { printf '0\n'; return 0; }
+  local end now secs
+  end="$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+  [ -n "$end" ] || { printf '0\n'; return 0; }
+  secs="$(date -d "$end" +%s 2>/dev/null)" || secs=""
+  if [ -z "$secs" ]; then
+    # Non-GNU date: fall back to openssl's own expiry answer via a binary probe
+    # (0 if expired, otherwise at least 1 — a coarse lower bound).
+    if openssl x509 -in "$1" -noout -checkend 0 >/dev/null 2>&1; then printf '1\n'; else printf '0\n'; fi
+    return 0
+  fi
+  now="$(date +%s)"
+  if [ "$secs" -le "$now" ]; then printf '0\n'; else printf '%s\n' "$(( (secs - now) / 86400 ))"; fi
+}
+
+# Generate a NEW key pair + self-signed cert ($1 = cert, $2 = key). Callers that
+# want to preserve a pinned key must keep the old key and reissue from it instead
+# (see cmd_renew_cert).
+generate_self_signed() {
+  local cert_path="$1" key_path="$2"
+  local san
+  if [[ "$DOMAIN" =~ ^[0-9.]+$ ]]; then san="IP:$DOMAIN"; else san="DNS:$DOMAIN"; fi
+  need_cmd openssl
+  mkdir -p "$(dirname "$key_path")"
+  openssl req -x509 -newkey rsa:2048 -nodes -days "$CERT_DAYS" \
+    -keyout "$key_path" -out "$cert_path" \
+    -subj "/CN=$DOMAIN" -addext "subjectAltName=$san" \
+    || die "failed to generate self-signed cert" 1
+  info "Self-signed cert written to $(dirname "$cert_path") ($CERT_DAYS days)"
+}
+
+# Reissue ONLY the cert from an EXISTING key, preserving the SAN (and therefore
+# the pinned public key). $1 = cert, $2 = key. The key must exist.
+reissue_cert_from_key() {
+  local cert_path="$1" key_path="$2"
+  local san
+  if [[ "$DOMAIN" =~ ^[0-9.]+$ ]]; then san="IP:$DOMAIN"; else san="DNS:$DOMAIN"; fi
+  need_cmd openssl
+  openssl req -x509 -new -key "$key_path" -nodes -days "$CERT_DAYS" \
+    -out "$cert_path" \
+    -subj "/CN=$DOMAIN" -addext "subjectAltName=$san" \
+    || die "failed to reissue cert from existing key" 1
+}
+
 setup_tls() {
   case "$TLS_MODE" in
     none)
@@ -585,7 +668,11 @@ setup_tls() {
       [ -n "$DOMAIN" ] || die "--tls nginx requires --domain" 2
       require_proxy nginx
       if [ "$DRY_RUN" -eq 1 ]; then
-        plan "write nginx config for $DOMAIN (cert: $([ $SELF_SIGNED -eq 1 ] && echo self-signed || echo existing))"
+        if [ "$SELF_SIGNED" -eq 1 ]; then
+          plan "write nginx config for $DOMAIN (self-signed cert, valid ${CERT_DAYS} days)"
+        else
+          plan "write nginx config for $DOMAIN (cert: existing)"
+        fi
         return 0
       fi
       local certdir nginx_root conf
@@ -599,15 +686,14 @@ setup_tls() {
       mkdir -p "$certdir"
       local cert_path="$certdir/cert.pem" key_path="$certdir/key.pem"
       if [ "$SELF_SIGNED" -eq 1 ]; then
-        # Self-signed: SAN = IP or domain, 30 days.
-        local san
-        if [[ "$DOMAIN" =~ ^[0-9.]+$ ]]; then san="IP:$DOMAIN"; else san="DNS:$DOMAIN"; fi
-        need_cmd openssl
-        openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-          -keyout "$key_path" -out "$cert_path" \
-          -subj "/CN=$DOMAIN" -addext "subjectAltName=$san" \
-          || die "failed to generate self-signed cert" 1
-        info "Self-signed cert written to $certdir (30 days)"
+        # Self-signed: SAN = IP or domain, valid for --cert-days days.
+        # Keep an existing key when its cert is still valid, so a resume or a
+        # repeat install never silently rotates the pinned public key.
+        if [ -f "$cert_path" ] && [ -f "$key_path" ] && cert_valid "$cert_path" 0; then
+          info "Existing self-signed cert at $cert_path is still valid; keeping key"
+        else
+          generate_self_signed "$cert_path" "$key_path"
+        fi
       else
         # Use existing cert paths under /etc/letsencrypt/live/<domain>.
         cert_path="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -771,6 +857,70 @@ cmd_backup_now() {
   do_backup
 }
 
+# --- renew-cert --------------------------------------------------------------
+# Reissue the self-signed cert. When key.pem exists we reissue ONLY cert.pem from
+# it, so the public key (and therefore the SPKI fingerprint the app pins) does
+# not change and every device keeps trusting the server transparently. When there
+# is no key we generate a fresh pair and warn that the pin changed.
+cmd_renew_cert() {
+  ssl_cert_paths
+  if [ ! -f "$KEY_PATH" ]; then
+    local domain="$DOMAIN"
+    # Domain may be empty when invoked standalone; derive from the existing cert
+    # when available so a reissue can run without re-specifying --domain.
+    if [ -z "$domain" ]; then
+      domain="$(openssl x509 -in "$CERT_PATH" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')"
+      [ -n "$domain" ] || domain="127.0.0.1"
+    fi
+    warn "no key.pem found; generating a NEW key pair"
+    warn "the SPKI fingerprint will CHANGE and every device must re-trust the certificate"
+    DOMAIN="$domain" generate_self_signed "$CERT_PATH" "$KEY_PATH"
+    reload_nginx_after_cert
+    echo "renewed: new key + cert written (SPKI changed)"
+    return 0
+  fi
+  local domain="$DOMAIN"
+  if [ -z "$domain" ]; then
+    domain="$(openssl x509 -in "$CERT_PATH" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')"
+    [ -n "$domain" ] || die "--domain required: cannot determine CN from a missing cert" 2
+  fi
+  # Preserve the previous cert so a failed nginx validation can roll back.
+  local backup="$CERT_PATH.prev.$$"
+  cp -p "$CERT_PATH" "$backup" 2>/dev/null || backup=""
+  DOMAIN="$domain" reissue_cert_from_key "$CERT_PATH" "$KEY_PATH"
+  if ! reload_nginx_after_cert; then
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      mv -f "$backup" "$CERT_PATH"
+      warn "restored previous cert.pem"
+    fi
+    die "renew-cert failed; previous cert restored" 1
+  fi
+  [ -n "$backup" ] && rm -f "$backup"
+  info "cert.pem reissued from the existing key (same public key; SPKI unchanged)"
+  echo "renewed: cert.pem"
+}
+
+# Validate the nginx config with the fresh cert and reload it. Returns nonzero on
+# failure so the caller can roll back the previous cert.
+reload_nginx_after_cert() {
+  if [ -n "$ROOT_PREFIX" ]; then
+    info "Test mode: skipping nginx -t / reload"
+    return 0
+  fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    warn "nginx not found on PATH; skipping config validation/reload"
+    return 0
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    warn "nginx -t failed with the new cert"
+    return 1
+  fi
+  systemctl reload nginx 2>/dev/null \
+    || systemctl start nginx 2>/dev/null \
+    || { warn "could not reload/start nginx"; return 1; }
+  return 0
+}
+
 # --- status ------------------------------------------------------------------
 cmd_status() {
   local cur="(no symlink)"
@@ -783,8 +933,25 @@ cmd_status() {
   else
     echo "install:     incomplete (re-run 'install' to resume)"
   fi
+  # Report certificate state when a self-signed pair exists (the app pins the
+  # public key, so print the SPKI fingerprint alongside the cert fingerprint).
+  ssl_cert_paths
+  if [ -f "$CERT_PATH" ]; then
+    echo "cert:        $CERT_PATH"
+    echo "cert-sha256: $(openssl x509 -in "$CERT_PATH" -noout -fingerprint -sha256 2>/dev/null | sed -E 's/^.*Fingerprint=//' | tr -d ':')"
+    echo "cert-spki:   $(spki_fingerprint "$CERT_PATH")"
+    echo "notAfter:    $(openssl x509 -in "$CERT_PATH" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    if ! cert_valid "$CERT_PATH" 0; then
+      printf 'ERROR: certificate has expired (notAfter above); run "%s renew-cert"\n' "$0" >&2
+      EXIT_NONZERO=1
+    elif ! cert_valid "$CERT_PATH" 14; then
+      # Within 14 days but not yet expired: warn loudly, still exit 0.
+      printf 'WARN: certificate expires in %s days\n' "$(cert_days_left "$CERT_PATH")" >&2
+    fi
+  fi
   if [ -n "$ROOT_PREFIX" ]; then
     echo "service:     n/a (--root test mode)"
+    [ "${EXIT_NONZERO:-0}" -eq 1 ] && exit 1
     return 0
   fi
   local st; st="$(systemctl is-active silique.service 2>/dev/null || echo unknown)"
@@ -792,6 +959,8 @@ cmd_status() {
   if systemctl list-timers silique-backup.timer >/dev/null 2>&1; then
     echo "backup:      timer enabled"
   fi
+  [ "${EXIT_NONZERO:-0}" -eq 1 ] && exit 1
+  return 0
 }
 
 # --- uninstall ---------------------------------------------------------------
@@ -845,6 +1014,7 @@ EOF
   Manage with:
     sudo $0 status
     sudo $0 backup-now
+    sudo $0 renew-cert
     sudo $0 upgrade <version>
 EOF
 }
@@ -867,6 +1037,7 @@ main() {
       --domain)         [ $# -ge 2 ] || { usage >&2; exit 2; }; DOMAIN="$2"; shift 2 ;;
       --tls)            [ $# -ge 2 ] || { usage >&2; exit 2; }; TLS_MODE="$2"; shift 2 ;;
       --self-signed)    SELF_SIGNED=1; shift ;;
+      --cert-days)      [ $# -ge 2 ] || { usage >&2; exit 2; }; CERT_DAYS="$2"; shift 2 ;;
       --no-backup-timer) NO_BACKUP_TIMER=1; shift ;;
       --node-bin)       [ $# -ge 2 ] || { usage >&2; exit 2; }; NODE_BIN="$2"; shift 2 ;;
       --yes)            YES=1; shift ;;
@@ -887,6 +1058,14 @@ main() {
   if [ "$SELF_SIGNED" -eq 1 ] && [ "$TLS_MODE" != "nginx" ]; then
     { printf 'error: --self-signed requires --tls nginx\n' >&2; usage >&2; exit 2; }
   fi
+  # --cert-days must be a positive integer (also validated when supplied
+  # without --self-signed, so a typo fails loudly at parse time).
+  case "$CERT_DAYS" in
+    ''|*[!0-9]*) { printf 'error: --cert-days must be a positive integer, got: %s\n' "$CERT_DAYS" >&2; exit 2; } ;;
+    *)          if [ "$CERT_DAYS" -le 0 ] 2>/dev/null; then
+                  printf 'error: --cert-days must be a positive integer, got: %s\n' "$CERT_DAYS" >&2; exit 2
+                fi ;;
+  esac
   if [ "$TLS_MODE" != "none" ] && [ -z "$DOMAIN" ]; then
     { printf 'error: --tls %s requires --domain\n' "$TLS_MODE" >&2; usage >&2; exit 2; }
   fi
@@ -907,6 +1086,7 @@ main() {
     upgrade)      INSTALL_CMD=upgrade; cmd_upgrade "$upgrade_arg" ;;
     backup-now)   INSTALL_CMD=backup-now; cmd_backup_now ;;
     status)       INSTALL_CMD=status; cmd_status ;;
+    renew-cert)   INSTALL_CMD=renew-cert; cmd_renew_cert ;;
     uninstall)    INSTALL_CMD=uninstall; cmd_uninstall ;;
     help)         INSTALL_CMD=help; usage ;;
     *)            die "unknown command: $cmd (see 'help')" 2 ;;
