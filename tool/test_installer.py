@@ -553,6 +553,28 @@ class InstallerTests(unittest.TestCase):
             "current symlink must remain on the previous release after failure",
         )
 
+    def test_24_installer_is_executable(self):
+        """The guide runs `sudo ./infra/install.sh`, so the file must carry the
+        executable bit in the repository, not just in a local checkout."""
+        path = os.path.normpath(
+            os.path.join(os.path.dirname(DOCS), "..", "infra", "install.sh"))
+        self.assertTrue(os.path.exists(path), "infra/install.sh missing")
+        mode = os.stat(path).st_mode
+        self.assertTrue(mode & 0o111,
+                        "infra/install.sh must be executable (chmod +x) or "
+                        "`./infra/install.sh` fails with Permission denied")
+        # Also assert the mode git records, so a plain checkout keeps the bit.
+        try:
+            out = subprocess.run(
+                ["git", "ls-files", "-s", "infra/install.sh"],
+                cwd=os.path.dirname(path), capture_output=True, text=True, timeout=20
+            ).stdout.strip()
+        except Exception:
+            out = ""
+        if out:
+            self.assertTrue(out.startswith("100755"),
+                            f"git index mode must be 100755, got: {out}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
