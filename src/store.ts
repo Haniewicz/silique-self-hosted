@@ -30,6 +30,16 @@ export class Store {
       CREATE TABLE IF NOT EXISTS image_assets(vault_id TEXT NOT NULL REFERENCES vaults(id),note_id TEXT NOT NULL,id TEXT NOT NULL,manifest TEXT,chunk_count INTEGER,PRIMARY KEY(vault_id,id));
       CREATE TABLE IF NOT EXISTS image_chunks(vault_id TEXT NOT NULL,asset_id TEXT NOT NULL,chunk_index INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(vault_id,asset_id,chunk_index),FOREIGN KEY(vault_id,asset_id) REFERENCES image_assets(vault_id,id) ON DELETE CASCADE);
       CREATE TABLE IF NOT EXISTS image_refs(vault_id TEXT NOT NULL,asset_id TEXT NOT NULL,note_id TEXT NOT NULL,PRIMARY KEY(vault_id,asset_id,note_id),FOREIGN KEY(vault_id,asset_id) REFERENCES image_assets(vault_id,id) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS purged_vaults(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),deleted_at TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS retired_vault_insert BEFORE INSERT ON vaults
+        WHEN EXISTS(SELECT 1 FROM purged_vaults WHERE id=NEW.id)
+        BEGIN SELECT RAISE(ABORT,'vault_deleted'); END;
+      CREATE TRIGGER IF NOT EXISTS retired_vault_update BEFORE UPDATE OF id ON vaults
+        WHEN EXISTS(SELECT 1 FROM purged_vaults WHERE id=NEW.id)
+        BEGIN SELECT RAISE(ABORT,'vault_deleted'); END;
+      CREATE TABLE IF NOT EXISTS vault_batch_receipts(user_id TEXT NOT NULL,batch_id TEXT NOT NULL,vault_id TEXT NOT NULL REFERENCES vaults(id),PRIMARY KEY(user_id,batch_id),FOREIGN KEY(user_id,batch_id) REFERENCES batches(user_id,id) ON DELETE CASCADE);
+      INSERT OR IGNORE INTO vault_batch_receipts(user_id,batch_id,vault_id)
+        SELECT b.user_id,b.id,r.vault_id FROM batches b JOIN json_each(b.response,'$.accepted') a JOIN revisions r ON r.id=a.value JOIN vaults v ON v.id=r.vault_id AND v.user_id=b.user_id;
       PRAGMA user_version=1;`);
   }
   async createUser(email: string, password: string) {

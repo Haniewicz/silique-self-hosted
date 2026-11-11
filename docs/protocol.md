@@ -63,3 +63,42 @@ Rewizje w batchach mogą zawierać dodatkowe `images: UUID[]`. Załączniki musz
 Discovery ogłasza `features.change_notifications=true`. `GET /v1/events` z Bearer tokenem zwraca wyłącznie `{cursor: string}`. Kolejne `GET /v1/events?since=<cursor>` czeka maksymalnie 15 s lub do zmiany we własnym koncie. Taki sam kursor oznacza brak zmian, inny kursor wymaga zwykłej synchronizacji. Kursor jest efemerycznym sygnałem unieważnienia, nie kursorem paginacji rewizji; nie wolno zapisywać go jako kursora vaulta. Restart serwera zmienia kursor.
 
 Endpoint nie zawiera treści notatek ani identyfikatorów innych kont. Sesja sprawdzana przed oczekiwaniem i przed odpowiedzią; rozłączenie i zamknięcie serwera zwalniają słuchacza. Limit: 32 oczekiwania na konto i 2048 globalnie. Stary serwer zwraca 404, więc klient wraca do synchronizacji co 25 s. Pomiędzy wywołaniami klient pozostawia jedno żądanie oczekujące, anuluje je w tle i używa ograniczonych ponowień po błędach. Pełna kontrola co 60 s pozostaje zabezpieczeniem.
+
+## Usuwanie całego vaulta (opcjonalne rozszerzenie)
+
+Discovery `/.well-known/silique` ogłasza `features.vault_deletion=true`. Dopiero klient
+obsługujący ten kontrakt może proponować usunięcie zsynchronizowanego vaulta.
+`DELETE /v1/vaults/:id` przyjmuje wyłącznie `{expectedVersion: integer >= 0}`.
+Wymaga aktywnej sesji właściciela; nieznany identyfikator daje 404, zmieniona
+wersja 409. Nazwa i świadome potwierdzenie są weryfikowane przez klienta;
+serwer nie otrzymuje jawnej nazwy ani hasła.
+
+Jedna transakcja utrwala `purged_vaults(id,user_id,deleted_at)` i usuwa vault,
+wrap klucza, zaszyfrowane metadane, wszystkie głowy i rewizje (także ukryte
+koperty i konfigurację), znaczniki usuniętych notatek oraz wszystkie obrazy,
+fragmenty i odniesienia, w tym nieukończone przesyłania. Usuwa też przypisane
+potwierdzenia batchy. Stare potwierdzenia są przypisywane przy otwarciu bazy,
+o ile istnieją jeszcze identyfikujące je rewizje. Historyczne osierocone
+potwierdzenia zawierające tylko hash i zaakceptowane UUID pozostają — nie
+można bezpiecznie przypisać ich vaultowi; nie zawierają treści ani kluczy.
+
+Potwierdzenie po COMMIT to `{deleted:true,vaultId:UUID}`; ponowienie zwraca tę
+samą odpowiedź niezależnie od dawnej wersji. `GET /v1/vaults` oprócz `vaults`
+zwraca `deletedVaults: UUID[]` konta niezależnie od kursorów rewizji. Klient
+musi zastosować je przed wysyłką, również dla zablokowanych vaultów. Pozostałe
+trasy vaulta, w tym PUT z wersją 0, stare batche i odczyty/zapisy obrazów,
+zwracają `410 {error:'vault_deleted'}`. Zatwierdzone DELETE budzi powiadomienia
+`/v1/events` konta. Nowy vault wymaga nowego UUID.
+
+Schemat jest addytywny. Trwałe triggery blokują INSERT/zmianę ID na wycofany
+UUID również po rollbacku samego kodu do wersji bez obsługi tombstones.
+Taki stary kod nie propaguje jednak usunięcia klientom i może zwracać 500
+zamiast 410 — po usunięciach trzeba używać kodu świadomego tego kontraktu.
+NIE usuwać tabeli/triggerów ani nie odtwarzać backupu sprzed usunięcia bez
+zachowania i ponownego zastosowania pełnej listy tombstones. Sam backup sprzed
+DELETE może zawierać usuniętą treść i klucze.
+
+Zakres to dane w bieżących tabelach serwera i późniejsze wycofanie na zgodnych
+połączonych klientach. Nie jest to gwarancja usunięcia kopii offline, starych
+klientów, eksportów, snapshotów systemu/SSD ani backupów objętych dotychczasową
+retencją. Testy używają wyłącznie syntetycznej bazy.

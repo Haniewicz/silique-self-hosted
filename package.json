@@ -1,6 +1,6 @@
 {
   "name": "silique-server",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Self-hosted single-user sync server for end-to-end encrypted notes (Node.js, Fastify, SQLite).",
   "main": "index.js",
   "directories": {

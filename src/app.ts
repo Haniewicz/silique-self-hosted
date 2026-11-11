@@ -45,7 +45,7 @@ export async function buildApp(config: Config) {
     if (reply.statusCode >= 300 || !(
       (req.method === 'PUT' && /^\/v1\/vaults\/[^/]+$/.test(path)) ||
       (req.method === 'POST' && path.endsWith('/batches')) ||
-      (req.method === 'DELETE' && /\/notes\/[^/]+$/.test(path))
+      (req.method === 'DELETE' && (/\/notes\/[^/]+$/.test(path) || /^\/v1\/vaults\/[^/]+$/.test(path)))
     )) return;
     try { changes.publish(auth(req.headers.authorization).userId); } catch { /* revoked */ }
   });
@@ -63,6 +63,8 @@ export async function buildApp(config: Config) {
     } finally { reply.raw.off('close', closed); }
   });
   const ownVault=(vaultId:string,userId:string)=> {
+    const retired=db.prepare('SELECT user_id FROM purged_vaults WHERE id=?').get(vaultId);
+    if(retired) throw new ApiError(retired.user_id===userId?410:404,retired.user_id===userId?'vault_deleted':'Vault not found');
     const row=db.prepare('SELECT * FROM vaults WHERE id=? AND user_id=?').get(vaultId,userId);
     if(!row) throw new ApiError(404,'Vault not found');
     return row;
@@ -77,7 +79,7 @@ export async function buildApp(config: Config) {
     return {token,userId,deviceId,accountEnvelope:user.envelope??null,expiresIn:30*86400};
   });
   app.get('/health',async()=>({status:'ok',protocol:1}));
-  app.get('/.well-known/silique',async()=>({name:'Silique',api_version:'1',registration:'first-user',features:{e2ee:true,multi_vault:true,device_pairing:true,recovery:true,revision_dag:true,image_attachments:true,change_notifications:true},limits:{batch:100,payload:2_000_000}}));
+  app.get('/.well-known/silique',async()=>({name:'Silique',api_version:'1',registration:'first-user',features:{e2ee:true,multi_vault:true,device_pairing:true,recovery:true,revision_dag:true,image_attachments:true,change_notifications:true,vault_deletion:true},limits:{batch:100,payload:2_000_000}}));
   app.post('/v1/auth/register',{config:{rateLimit:{max:config.rateLimitMax ?? 5,timeWindow:'1 minute'}}},async(req,reply)=> {
     const data=credentials.parse(req.body);
     // createUser enforces the single-user limit inside a transaction: the
@@ -158,12 +160,35 @@ export async function buildApp(config: Config) {
   });
   app.get('/v1/vaults',async(req)=> {
     const who=auth(req.headers.authorization);
-    return {vaults:db.prepare('SELECT id,key_wrap AS keyWrap,metadata,version FROM vaults WHERE user_id=? ORDER BY id').all(who.userId)};
+    return {vaults:db.prepare('SELECT id,key_wrap AS keyWrap,metadata,version FROM vaults WHERE user_id=? ORDER BY id').all(who.userId),deletedVaults:db.prepare('SELECT id FROM purged_vaults WHERE user_id=? ORDER BY id').all(who.userId).map(row=>row.id)};
+  });
+  app.delete('/v1/vaults/:id',async(req)=> {
+    const who=auth(req.headers.authorization),vaultId=id.parse((req.params as {id:string}).id);
+    const data=z.object({expectedVersion:z.number().int().nonnegative()}).strict().parse(req.body);
+    return store.transaction(()=> {
+      const retired=db.prepare('SELECT user_id FROM purged_vaults WHERE id=?').get(vaultId);
+      if(retired) {
+        if(retired.user_id!==who.userId) throw new ApiError(404,'Vault not found');
+        return {deleted:true,vaultId};
+      }
+      const vault=ownVault(vaultId,who.userId);
+      if(vault.version!==data.expectedVersion) throw new ApiError(409,'Vault keys changed; reload before retrying');
+      db.prepare('INSERT INTO purged_vaults(id,user_id,deleted_at) VALUES(?,?,?)').run(vaultId,who.userId,new Date().toISOString());
+      db.prepare('DELETE FROM batches WHERE user_id=? AND id IN (SELECT batch_id FROM vault_batch_receipts WHERE user_id=? AND vault_id=?)').run(who.userId,who.userId,vaultId);
+      db.prepare('DELETE FROM heads WHERE vault_id=?').run(vaultId);
+      db.prepare('DELETE FROM revisions WHERE vault_id=?').run(vaultId);
+      db.prepare('DELETE FROM purged_notes WHERE vault_id=?').run(vaultId);
+      db.prepare('DELETE FROM image_assets WHERE vault_id=?').run(vaultId);
+      db.prepare('DELETE FROM vaults WHERE id=?').run(vaultId);
+      return {deleted:true,vaultId};
+    });
   });
   app.put('/v1/vaults/:id',async(req,reply)=> {
     const who=auth(req.headers.authorization);const vaultId=id.parse((req.params as {id:string}).id);
     const data=z.object({keyWrap:opaque,metadata:opaque,expectedVersion:z.number().int().nonnegative()}).strict().parse(req.body);
     return store.transaction(()=> {
+      const retired=db.prepare('SELECT user_id FROM purged_vaults WHERE id=?').get(vaultId);
+      if(retired) throw new ApiError(retired.user_id===who.userId?410:404,retired.user_id===who.userId?'vault_deleted':'Vault not found');
       const existing=db.prepare('SELECT * FROM vaults WHERE id=?').get(vaultId);
       if(existing && existing.user_id!==who.userId) throw new ApiError(404,'Vault not found');
       if(Number(existing?.version??0)!==data.expectedVersion) throw new ApiError(409,'Vault keys changed; reload before retrying');
@@ -272,7 +297,8 @@ export async function buildApp(config: Config) {
         db.prepare('INSERT INTO heads VALUES(?,?,?)').run(vaultId,rev.noteId,rev.id);
       }
       const response={accepted:data.revisions.map(r=>r.id),batchId:data.batchId};
-      db.prepare('INSERT INTO batches VALUES(?,?,?,?)').run(who.userId,data.batchId,hash,JSON.stringify(response));
+      db.prepare('INSERT INTO batches(user_id,id,hash,response) VALUES(?,?,?,?)').run(who.userId,data.batchId,hash,JSON.stringify(response));
+      db.prepare('INSERT INTO vault_batch_receipts(user_id,batch_id,vault_id) VALUES(?,?,?)').run(who.userId,data.batchId,vaultId);
       return response;
     });
   });
